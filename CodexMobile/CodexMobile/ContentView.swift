@@ -10,6 +10,7 @@ struct ContentView: View {
     @Environment(CodexService.self) private var codex
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     @State private var viewModel = ContentViewModel()
     @State private var isSidebarOpen = false
@@ -52,6 +53,9 @@ struct ContentView: View {
                 }
             }
             .onChange(of: selectedThread) { previousThread, thread in
+                if thread != nil {
+                    navigationPath = NavigationPath()
+                }
                 codex.handleDisplayedThreadChange(
                     from: previousThread?.id,
                     to: thread?.id
@@ -137,7 +141,7 @@ struct ContentView: View {
         } else if isShowingManualScanner && !codex.isConnected {
             qrScannerBody
         } else if codex.isConnected || viewModel.isAttemptingAutoReconnect || shouldShowReconnectShell {
-            mainAppBody
+            adaptiveMainAppBody
         } else {
             qrScannerBody
         }
@@ -187,6 +191,33 @@ struct ContentView: View {
         .gesture(edgeDragGesture)
     }
 
+    @ViewBuilder
+    private var adaptiveMainAppBody: some View {
+        if usesPadShell {
+            splitMainAppBody
+        } else {
+            mainAppBody
+        }
+    }
+
+    private var splitMainAppBody: some View {
+        NavigationSplitView {
+            SidebarView(
+                selectedThread: $selectedThread,
+                showSettings: $showSettings,
+                isSearchActive: $isSearchActive,
+                onClose: {},
+            )
+            .navigationSplitViewColumnWidth(min: sidebarWidth, ideal: 360, max: 420)
+        } detail: {
+            mainNavigationLayer
+                .id(selectedThread?.id ?? "home")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(.systemBackground))
+        }
+        .navigationSplitViewStyle(.balanced)
+    }
+
     // MARK: - Layers
 
     private var mainNavigationLayer: some View {
@@ -208,11 +239,7 @@ struct ContentView: View {
         if let thread = selectedThread {
             TurnView(thread: thread)
                 .id(thread.id)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        hamburgerButton
-                    }
-                }
+                .toolbar { mainContentToolbar }
         } else {
             HomeEmptyStateView(
                 connectionPhase: homeConnectionPhase,
@@ -235,10 +262,15 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                 }
             }
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    hamburgerButton
-                }
+            .toolbar { mainContentToolbar }
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var mainContentToolbar: some ToolbarContent {
+        if !usesPadShell {
+            ToolbarItem(placement: .topBarLeading) {
+                hamburgerButton
             }
         }
     }
@@ -357,6 +389,10 @@ struct ContentView: View {
             get: { codex.bridgeUpdatePrompt },
             set: { codex.bridgeUpdatePrompt = $0 }
         )
+    }
+
+    private var usesPadShell: Bool {
+        horizontalSizeClass == .regular
     }
 
     // Re-tries the saved relay session after the user updates the Mac package.

@@ -64,6 +64,7 @@ private struct FileChangeActionButtons: View {
     var showInlineCommit: Bool = false
 
     @Environment(\.inlineCommitAndPushAction) private var commitAction
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var isShowingDiffSheet = false
 
     var body: some View {
@@ -114,7 +115,7 @@ private struct FileChangeActionButtons: View {
                 .buttonStyle(.plain)
             }
         }
-        .sheet(isPresented: $isShowingDiffSheet) {
+        .sheet(isPresented: compactDiffPresentationBinding) {
             TurnDiffSheet(
                 title: "Changes",
                 entries: entries,
@@ -122,6 +123,32 @@ private struct FileChangeActionButtons: View {
                 messageID: messageID
             )
         }
+        .fullScreenCover(isPresented: fullScreenDiffPresentationBinding) {
+            TurnDiffSheet(
+                title: "Changes",
+                entries: entries,
+                bodyText: bodyText,
+                messageID: messageID
+            )
+        }
+    }
+
+    private var usesPadDiffPresentation: Bool {
+        horizontalSizeClass == .regular
+    }
+
+    private var compactDiffPresentationBinding: Binding<Bool> {
+        Binding(
+            get: { !usesPadDiffPresentation && isShowingDiffSheet },
+            set: { isShowingDiffSheet = $0 }
+        )
+    }
+
+    private var fullScreenDiffPresentationBinding: Binding<Bool> {
+        Binding(
+            get: { usesPadDiffPresentation && isShowingDiffSheet },
+            set: { isShowingDiffSheet = $0 }
+        )
     }
 }
 

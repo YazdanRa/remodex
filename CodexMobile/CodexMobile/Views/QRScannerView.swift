@@ -8,6 +8,9 @@ import AVFoundation
 import SwiftUI
 
 struct QRScannerView: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.openURL) private var openURL
+
     let onScan: (CodexPairingQRPayload) -> Void
 
     @State private var scannerError: String?
@@ -15,21 +18,23 @@ struct QRScannerView: View {
     @State private var isCheckingPermission = true
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+        GeometryReader { geometry in
+            ZStack {
+                Color.black.ignoresSafeArea()
 
-            if isCheckingPermission {
-                ProgressView()
-                    .tint(.white)
-            } else if hasCameraPermission {
-                QRCameraPreview { code, resetScanLock in
-                    handleScanResult(code, resetScanLock: resetScanLock)
+                if isCheckingPermission {
+                    ProgressView()
+                        .tint(.white)
+                } else if hasCameraPermission {
+                    QRCameraPreview { code, resetScanLock in
+                        handleScanResult(code, resetScanLock: resetScanLock)
+                    }
+                    .ignoresSafeArea()
+
+                    scannerOverlay(for: geometry.size.width)
+                } else {
+                    cameraPermissionView(for: geometry.size.width)
                 }
-                .ignoresSafeArea()
-
-                scannerOverlay
-            } else {
-                cameraPermissionView
             }
         }
         .task {
@@ -45,13 +50,15 @@ struct QRScannerView: View {
         }
     }
 
-    private var scannerOverlay: some View {
-        VStack(spacing: 24) {
+    private func scannerOverlay(for availableWidth: CGFloat) -> some View {
+        let frameSize = scannerFrameSize(for: availableWidth)
+
+        return VStack(spacing: 24) {
             Spacer()
 
             RoundedRectangle(cornerRadius: 20)
                 .stroke(Color.white.opacity(0.6), lineWidth: 2)
-                .frame(width: 250, height: 250)
+                .frame(width: frameSize, height: frameSize)
 
             Text("Scan QR code from Remodex CLI")
                 .font(AppFont.subheadline(weight: .medium))
@@ -61,8 +68,10 @@ struct QRScannerView: View {
         }
     }
 
-    private var cameraPermissionView: some View {
-        VStack(spacing: 20) {
+    private func cameraPermissionView(for availableWidth: CGFloat) -> some View {
+        let maxWidth = permissionContentWidth(for: availableWidth)
+
+        return VStack(spacing: 20) {
             Image(systemName: "camera.fill")
                 .font(.system(size: 48))
                 .foregroundStyle(.secondary)
@@ -78,12 +87,30 @@ struct QRScannerView: View {
                 .padding(.horizontal, 40)
 
             Button("Open Settings") {
-                if let url = URL(string: UIApplication.openSettingsURLString) {
-                    UIApplication.shared.open(url)
+                if let url = URL(string: "app-settings:") {
+                    openURL(url)
                 }
             }
             .buttonStyle(.borderedProminent)
         }
+        .frame(maxWidth: maxWidth)
+        .padding(.horizontal, 24)
+    }
+
+    private var usesRegularPadLayout: Bool {
+        horizontalSizeClass == .regular
+    }
+
+    private func scannerFrameSize(for availableWidth: CGFloat) -> CGFloat {
+        usesWidePadLayout(for: availableWidth) ? 320 : 250
+    }
+
+    private func permissionContentWidth(for availableWidth: CGFloat) -> CGFloat {
+        usesWidePadLayout(for: availableWidth) ? 460 : 360
+    }
+
+    private func usesWidePadLayout(for availableWidth: CGFloat) -> Bool {
+        usesRegularPadLayout && availableWidth >= 900
     }
 
     private func checkCameraPermission() async {
@@ -164,23 +191,48 @@ private class QRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate {
     var onScan: ((String) -> Void)?
 
     private let captureSession = AVCaptureSession()
+    private let metadataOutput = AVCaptureMetadataOutput()
     private let sessionQueue = DispatchQueue(label: "com.phodex.qr-camera")
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private var hasScanned = false
+    private var currentVideoOrientation: AVCaptureVideoOrientation = .portrait
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        startObservingDeviceOrientation()
         setupCamera()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+        startObservingDeviceOrientation()
         setupCamera()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         previewLayer?.frame = bounds
+        updateCaptureOrientation()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        updateCaptureOrientation()
+    }
+
+    @objc
+    private func handleDeviceOrientationDidChange() {
+        updateCaptureOrientation()
+    }
+
+    private func startObservingDeviceOrientation() {
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDeviceOrientationDidChange),
+            name: UIDevice.orientationDidChangeNotification,
+            object: nil
+        )
     }
 
     private func setupCamera() {
@@ -193,20 +245,51 @@ private class QRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate {
             captureSession.addInput(input)
         }
 
-        let output = AVCaptureMetadataOutput()
-        if captureSession.canAddOutput(output) {
-            captureSession.addOutput(output)
-            output.setMetadataObjectsDelegate(self, queue: .main)
-            output.metadataObjectTypes = [.qr]
+        if captureSession.canAddOutput(metadataOutput) {
+            captureSession.addOutput(metadataOutput)
+            metadataOutput.setMetadataObjectsDelegate(self, queue: .main)
+            metadataOutput.metadataObjectTypes = [.qr]
         }
 
         let layer = AVCaptureVideoPreviewLayer(session: captureSession)
         layer.videoGravity = .resizeAspectFill
         self.layer.addSublayer(layer)
         previewLayer = layer
+        updateCaptureOrientation()
 
         sessionQueue.async { [weak self] in
             self?.captureSession.startRunning()
+        }
+    }
+
+    private func updateCaptureOrientation() {
+        let orientation = captureVideoOrientation(for: UIDevice.current.orientation) ?? currentVideoOrientation
+
+        if let connection = previewLayer?.connection,
+           connection.isVideoOrientationSupported {
+            connection.videoOrientation = orientation
+        }
+
+        if let connection = metadataOutput.connection(with: .video),
+           connection.isVideoOrientationSupported {
+            connection.videoOrientation = orientation
+        }
+
+        currentVideoOrientation = orientation
+    }
+
+    private func captureVideoOrientation(for deviceOrientation: UIDeviceOrientation) -> AVCaptureVideoOrientation? {
+        switch deviceOrientation {
+        case .portrait:
+            return .portrait
+        case .portraitUpsideDown:
+            return .portraitUpsideDown
+        case .landscapeLeft:
+            return .landscapeRight
+        case .landscapeRight:
+            return .landscapeLeft
+        default:
+            return nil
         }
     }
 
@@ -232,6 +315,9 @@ private class QRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate {
     }
 
     deinit {
+        NotificationCenter.default.removeObserver(self)
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
+
         let session = captureSession
         sessionQueue.async {
             session.stopRunning()
