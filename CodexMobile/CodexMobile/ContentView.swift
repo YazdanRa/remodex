@@ -52,15 +52,16 @@ struct ContentView: View {
                     closeSidebar()
                 }
             }
-            .onChange(of: selectedThread) { previousThread, thread in
-                if thread != nil {
+            .onChange(of: selectedThread?.id) { previousThreadID, threadID in
+                if let threadID, previousThreadID != threadID {
+                    // Leaving pushed destinations like Settings keeps the newly selected chat visible.
                     navigationPath = NavigationPath()
                 }
                 codex.handleDisplayedThreadChange(
-                    from: previousThread?.id,
-                    to: thread?.id
+                    from: previousThreadID,
+                    to: threadID
                 )
-                codex.activeThreadId = thread?.id
+                codex.activeThreadId = threadID
             }
             .onChange(of: codex.activeThreadId) { _, activeThreadId in
                 guard let activeThreadId,
