@@ -21,6 +21,7 @@ struct ContentView: View {
     @State private var isShowingManualScanner = false
     @State private var isSearchActive = false
     @State private var isRetryingBridgeUpdate = false
+    @State private var isPreparingManualScanner = false
     @State private var threadCompletionBannerDismissTask: Task<Void, Never>?
     @AppStorage("codex.hasSeenOnboarding") private var hasSeenOnboarding = false
 
@@ -114,6 +115,23 @@ struct ContentView: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
             }
+            .alert(
+                "Chat Deleted",
+                isPresented: missingNotificationThreadAlertIsPresented,
+                presenting: codex.missingNotificationThreadPrompt
+            ) { _ in
+                Button("Not Now", role: .cancel) {
+                    codex.missingNotificationThreadPrompt = nil
+                }
+                Button("Start New Chat") {
+                    codex.missingNotificationThreadPrompt = nil
+                    Task {
+                        await startNewThreadFromMissingNotificationAlert()
+                    }
+                }
+            } message: { _ in
+                Text("This chat is no longer available. Start a new chat instead?")
+            }
             .overlay(alignment: .top) {
                 if let banner = codex.threadCompletionBanner {
                     ThreadCompletionBannerView(
@@ -141,7 +159,10 @@ struct ContentView: View {
             }
         } else if isShowingManualScanner && !codex.isConnected {
             qrScannerBody
-        } else if codex.isConnected || viewModel.isAttemptingAutoReconnect || shouldShowReconnectShell {
+        } else if codex.isConnected
+            || viewModel.isAttemptingAutoReconnect
+            || shouldShowReconnectShell
+            || isPreparingManualScanner {
             adaptiveMainAppBody
         } else {
             qrScannerBody
@@ -253,14 +274,12 @@ struct ContentView: View {
             ) {
                 if homeConnectionPhase == .connecting || (codex.hasSavedRelaySession && !codex.isConnected) {
                     Button("Scan New QR Code") {
-                        Task {
-                            await viewModel.stopAutoReconnectForManualScan(codex: codex)
-                        }
-                        isShowingManualScanner = true
+                        presentManualScannerAfterStoppingReconnect()
                     }
                     .font(AppFont.subheadline(weight: .semibold))
                     .foregroundStyle(.primary)
                     .buttonStyle(.plain)
+                    .disabled(isPreparingManualScanner)
                 }
             }
             .toolbar { mainContentToolbar }
@@ -364,9 +383,15 @@ struct ContentView: View {
         }
     }
 
-    // Shows the remembered pairing shell after app relaunch so the user can reconnect without rescanning.
+    // Shows the remembered pairing shell while a saved pairing can still be retried.
     private var shouldShowReconnectShell: Bool {
-        codex.hasSavedRelaySession && !isShowingManualScanner
+        codex.hasSavedRelaySession
+            && !isShowingManualScanner
+            && (codex.isConnecting
+                || viewModel.isAttemptingAutoReconnect
+                || codex.shouldAutoReconnectOnForeground
+                || isRetryingSavedPairing
+                || hasIdleSavedPairingRecovery)
     }
 
     // Keeps home status honest during reconnect loops while letting post-connect sync show separately.
@@ -375,6 +400,27 @@ struct ContentView: View {
             return .connecting
         }
         return codex.connectionPhase
+    }
+
+    private var isRetryingSavedPairing: Bool {
+        if case .retrying = codex.connectionRecoveryState {
+            return true
+        }
+        return false
+    }
+
+    // Keeps the reconnect CTA visible after retries stop, unless the pairing must be replaced.
+    private var hasIdleSavedPairingRecovery: Bool {
+        guard codex.hasSavedRelaySession,
+              !codex.isConnected,
+              codex.secureConnectionState != .rePairRequired else {
+            return false
+        }
+
+        return !codex.isConnecting
+            && !viewModel.isAttemptingAutoReconnect
+            && !codex.shouldAutoReconnectOnForeground
+            && !isRetryingSavedPairing
     }
 
     private func finishGesture(open: Bool) {
@@ -389,6 +435,17 @@ struct ContentView: View {
         Binding(
             get: { codex.bridgeUpdatePrompt },
             set: { codex.bridgeUpdatePrompt = $0 }
+        )
+    }
+
+    private var missingNotificationThreadAlertIsPresented: Binding<Bool> {
+        Binding(
+            get: { codex.missingNotificationThreadPrompt != nil },
+            set: { isPresented in
+                if !isPresented {
+                    codex.missingNotificationThreadPrompt = nil
+                }
+            }
         )
     }
 
@@ -416,12 +473,34 @@ struct ContentView: View {
     private func presentManualScannerForBridgeRecovery() {
         codex.bridgeUpdatePrompt = nil
         isRetryingBridgeUpdate = false
+        presentManualScannerAfterStoppingReconnect()
+    }
+
+    // Waits for reconnect teardown before showing the scanner so stale retries cannot race the new QR flow.
+    private func presentManualScannerAfterStoppingReconnect() {
+        guard !isPreparingManualScanner, !isShowingManualScanner else {
+            return
+        }
+
+        isPreparingManualScanner = true
 
         Task {
             await viewModel.stopAutoReconnectForManualScan(codex: codex)
             await MainActor.run {
-                isShowingManualScanner = true
+                isPreparingManualScanner = false
+                if !codex.isConnected {
+                    isShowingManualScanner = true
+                }
             }
+        }
+    }
+
+    private func startNewThreadFromMissingNotificationAlert() async {
+        do {
+            let thread = try await codex.startThread()
+            selectedThread = thread
+        } catch {
+            codex.lastErrorMessage = codex.userFacingTurnErrorMessage(from: error)
         }
     }
 

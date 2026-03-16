@@ -50,6 +50,8 @@ struct QueuedTurnDraft: Identifiable {
     let text: String
     let attachments: [CodexImageAttachment]
     let skillMentions: [CodexTurnSkillMention]
+    // Preserves special send semantics, such as plan mode, while a busy thread queues locally.
+    let collaborationMode: CodexCollaborationModeKind?
     let createdAt: Date
 }
 
@@ -113,6 +115,7 @@ final class TurnViewModel {
     var selectedGitBaseBranch = ""
     var currentGitBranch = ""
     var availableGitBranchTargets: [String] = []
+    var gitBranchesCheckedOutElsewhere: Set<String> = []
     var gitDefaultBranch = ""
     var gitRepoSync: GitRepoSyncResult? = nil
     var gitSyncState: String? { gitRepoSync?.state }
@@ -722,7 +725,7 @@ final class TurnViewModel {
         composerAttachments[index].state = state
     }
 
-    // Sends a composer payload, preferring turn/steer when a run is already active.
+    // Sends a composer payload, queueing follow-ups while the current run is still active.
     func sendTurn(codex: CodexService, threadID: String) {
         let payload = buildPayloadWithMentions()
         let attachments = readyComposerAttachments
@@ -748,6 +751,7 @@ final class TurnViewModel {
             text: payload,
             attachments: attachments,
             skillMentions: skillMentions,
+            collaborationMode: isPlanModeArmed ? .plan : nil,
             createdAt: Date()
         ) : nil
         let pendingSend = PendingTurnSend(
@@ -772,6 +776,7 @@ final class TurnViewModel {
             if stillBusy {
                 await performBusyThreadSend(
                     pendingSend,
+                    queuedDraft: queuedDraft,
                     codex: codex,
                     threadID: threadID
                 )
@@ -815,7 +820,8 @@ final class TurnViewModel {
                     userInput: nextDraft.text,
                     threadId: threadID,
                     attachments: nextDraft.attachments,
-                    skillMentions: nextDraft.skillMentions
+                    skillMentions: nextDraft.skillMentions,
+                    collaborationMode: nextDraft.collaborationMode
                 )
             } catch {
                 shouldAnchorToAssistantResponse = false
@@ -861,7 +867,8 @@ final class TurnViewModel {
                         userInput: draft.text,
                         threadId: threadID,
                         attachments: draft.attachments,
-                        skillMentions: draft.skillMentions
+                        skillMentions: draft.skillMentions,
+                        collaborationMode: draft.collaborationMode
                     )
                     removeQueuedDraft(id: id, codex: codex, threadID: threadID)
                     return
@@ -877,7 +884,8 @@ final class TurnViewModel {
                     expectedTurnId: expectedTurnID,
                     attachments: draft.attachments,
                     skillMentions: draft.skillMentions,
-                    shouldAppendUserMessage: true
+                    shouldAppendUserMessage: true,
+                    collaborationMode: draft.collaborationMode
                 )
                 removeQueuedDraft(id: id, codex: codex, threadID: threadID)
             } catch {
@@ -1373,9 +1381,10 @@ final class TurnViewModel {
         codex.activeTurnID(for: threadID) != nil || codex.runningThreadIDs.contains(threadID)
     }
 
-    // Reuses the active turn when possible so follow-up chat sends steer the current run instead of waiting in queue.
+    // Queues normal follow-ups while a run is active; explicit steer stays behind the queued-draft action.
     private func performBusyThreadSend(
         _ pendingSend: PendingTurnSend,
+        queuedDraft: QueuedTurnDraft?,
         codex: CodexService,
         threadID: String
     ) async {
@@ -1386,42 +1395,16 @@ final class TurnViewModel {
             return
         }
 
+        guard let queuedDraft else {
+            restoreComposerState(from: pendingSend)
+            shouldAnchorToAssistantResponse = false
+            return
+        }
+
         isPlanModeArmed = false
         shouldAnchorToAssistantResponse = true
+        appendQueuedDraft(queuedDraft, codex: codex, threadID: threadID)
         clearComposer()
-
-        do {
-            let expectedTurnID = try await resolveSteerExpectedTurnID(
-                codex: codex,
-                threadID: threadID
-            )
-
-            try await codex.steerTurn(
-                userInput: pendingSend.payload,
-                threadId: threadID,
-                expectedTurnId: expectedTurnID,
-                attachments: pendingSend.attachments,
-                skillMentions: pendingSend.skillMentions,
-                shouldAppendUserMessage: true
-            )
-        } catch {
-            let stillBusy = await refreshBusyStateIfNeeded(codex: codex, threadID: threadID, wasBusy: true)
-            if !stillBusy {
-                codex.removeLatestFailedUserMessage(
-                    threadId: threadID,
-                    matchingText: pendingSend.payload,
-                    matchingAttachments: pendingSend.attachments
-                )
-                await performTurnSend(pendingSend, codex: codex, threadID: threadID)
-                return
-            }
-
-            shouldAnchorToAssistantResponse = false
-            restoreComposerState(from: pendingSend)
-            if codex.lastErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
-                codex.lastErrorMessage = codex.userFacingTurnErrorMessage(from: error)
-            }
-        }
     }
 
     // Sends the prepared payload and restores the exact raw composer state if startTurn fails.
@@ -1834,6 +1817,7 @@ final class TurnViewModel {
             do {
                 let result = try await gitService.branchesWithStatus()
                 availableGitBranchTargets = result.branches
+                gitBranchesCheckedOutElsewhere = result.branchesCheckedOutElsewhere
                 if let current = result.currentBranch, !current.isEmpty {
                     currentGitBranch = current
                 }
@@ -1897,6 +1881,15 @@ final class TurnViewModel {
                   !codex.runningThreadIDs.contains(threadID),
                   !self.isRunningGitAction,
                   !self.isSwitchingGitBranch else { return }
+
+            if gitBranchesCheckedOutElsewhere.contains(branch) {
+                gitSyncAlert = TurnGitSyncAlert(
+                    title: "Branch Switch Failed",
+                    message: "Cannot switch branches: this branch is already open in another worktree.",
+                    action: .dismissOnly
+                )
+                return
+            }
 
             self.isSwitchingGitBranch = true
             defer { self.isSwitchingGitBranch = false }
