@@ -1,5 +1,6 @@
 // FILE: CodexThread.swift
-// Purpose: Represents a Codex conversation thread returned by thread/list and related events.
+// Purpose: Represents a Codex conversation thread returned by thread/list and related events,
+//   including native subagent identity metadata used by the sidebar and parent-child navigation.
 // Layer: Model
 // Exports: CodexThread
 // Depends on: JSONValue
@@ -20,6 +21,13 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
     var updatedAt: Date?
     var cwd: String?
     var metadata: [String: JSONValue]?
+    var forkedFromThreadId: String?
+    var parentThreadId: String?
+    var agentId: String?
+    var agentNickname: String?
+    var agentRole: String?
+    var model: String?
+    var modelProvider: String?
     var syncState: CodexThreadSyncState
 
     // --- Public initializer ---------------------------------------------------
@@ -33,6 +41,13 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         updatedAt: Date? = nil,
         cwd: String? = nil,
         metadata: [String: JSONValue]? = nil,
+        forkedFromThreadId: String? = nil,
+        parentThreadId: String? = nil,
+        agentId: String? = nil,
+        agentNickname: String? = nil,
+        agentRole: String? = nil,
+        model: String? = nil,
+        modelProvider: String? = nil,
         syncState: CodexThreadSyncState = .live
     ) {
         self.id = id
@@ -43,6 +58,13 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         self.updatedAt = updatedAt
         self.cwd = Self.normalizeProjectPath(cwd)
         self.metadata = metadata
+        self.forkedFromThreadId = Self.normalizeIdentifier(forkedFromThreadId)
+        self.parentThreadId = Self.normalizeIdentifier(parentThreadId)
+        self.agentId = Self.normalizeIdentifier(agentId)
+        self.agentNickname = Self.normalizeIdentifier(agentNickname)
+        self.agentRole = Self.normalizeIdentifier(agentRole)
+        self.model = Self.normalizeIdentifier(model)
+        self.modelProvider = Self.normalizeIdentifier(modelProvider)
         self.syncState = syncState
     }
 
@@ -61,6 +83,21 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         case cwdSnake = "current_working_directory"
         case cwdWorkingDirectory = "working_directory"
         case metadata
+        case forkedFromThreadId
+        case forkedFromId = "forkedFromId"
+        case forkedFromThreadIdSnake = "forked_from_thread_id"
+        case forkedFromIdSnake = "forked_from_id"
+        case parentThreadId
+        case parentThreadIdSnake = "parent_thread_id"
+        case agentId
+        case agentIdSnake = "agent_id"
+        case agentNickname
+        case agentNicknameSnake = "agent_nickname"
+        case agentRole
+        case agentRoleSnake = "agent_role"
+        case model
+        case modelProvider
+        case modelProviderSnake = "model_provider"
         case syncState
     }
 
@@ -77,6 +114,48 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         updatedAt = try Self.decodeDateIfPresent(from: container, keys: [.updatedAt, .updatedAtSnake])
         cwd = Self.decodeStringIfPresent(from: container, keys: [.cwd, .cwdSnake, .cwdWorkingDirectory])
         metadata = try container.decodeIfPresent([String: JSONValue].self, forKey: .metadata)
+        forkedFromThreadId = Self.decodeThreadIdentity(
+            from: container,
+            metadata: metadata,
+            keys: [.forkedFromThreadId, .forkedFromId, .forkedFromThreadIdSnake, .forkedFromIdSnake],
+            metadataKeys: ["forkedFromThreadId", "forked_from_thread_id", "forkedFromId", "forked_from_id"]
+        )
+        parentThreadId = Self.decodeThreadIdentity(
+            from: container,
+            metadata: metadata,
+            keys: [.parentThreadId, .parentThreadIdSnake],
+            metadataKeys: ["parentThreadId", "parent_thread_id"]
+        )
+        agentId = Self.decodeThreadIdentity(
+            from: container,
+            metadata: metadata,
+            keys: [.agentId, .agentIdSnake],
+            metadataKeys: ["agentId", "agent_id"]
+        )
+        agentNickname = Self.decodeThreadIdentity(
+            from: container,
+            metadata: metadata,
+            keys: [.agentNickname, .agentNicknameSnake],
+            metadataKeys: ["agentNickname", "agent_nickname", "nickname", "name"]
+        )
+        agentRole = Self.decodeThreadIdentity(
+            from: container,
+            metadata: metadata,
+            keys: [.agentRole, .agentRoleSnake],
+            metadataKeys: ["agentRole", "agent_role", "agentType", "agent_type"]
+        )
+        model = Self.decodeThreadIdentity(
+            from: container,
+            metadata: metadata,
+            keys: [.model],
+            metadataKeys: ["model", "modelName", "model_name"]
+        )
+        modelProvider = Self.decodeThreadIdentity(
+            from: container,
+            metadata: metadata,
+            keys: [.modelProvider, .modelProviderSnake],
+            metadataKeys: ["modelProvider", "model_provider", "modelProviderId", "model_provider_id"]
+        )
         syncState = try container.decodeIfPresent(CodexThreadSyncState.self, forKey: .syncState) ?? .live
     }
 
@@ -93,6 +172,13 @@ struct CodexThread: Identifiable, Codable, Hashable, Sendable {
         try container.encodeIfPresent(updatedAt, forKey: .updatedAt)
         try container.encodeIfPresent(Self.normalizeProjectPath(cwd), forKey: .cwd)
         try container.encodeIfPresent(metadata, forKey: .metadata)
+        try container.encodeIfPresent(Self.normalizeIdentifier(forkedFromThreadId), forKey: .forkedFromThreadId)
+        try container.encodeIfPresent(Self.normalizeIdentifier(parentThreadId), forKey: .parentThreadId)
+        try container.encodeIfPresent(Self.normalizeIdentifier(agentId), forKey: .agentId)
+        try container.encodeIfPresent(Self.normalizeIdentifier(agentNickname), forKey: .agentNickname)
+        try container.encodeIfPresent(Self.normalizeIdentifier(agentRole), forKey: .agentRole)
+        try container.encodeIfPresent(Self.normalizeIdentifier(model), forKey: .model)
+        try container.encodeIfPresent(Self.normalizeIdentifier(modelProvider), forKey: .modelProvider)
         try container.encode(syncState, forKey: .syncState)
     }
 }
@@ -103,11 +189,18 @@ extension CodexThread {
     var displayTitle: String {
         let cleanedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanedAgentLabel = agentDisplayLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedPreview = preview?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Prefer explicit thread name (AI/user rename) over server title fallback.
         if let cleanedName, !cleanedName.isEmpty {
             return cleanedName
+        }
+
+        if let cleanedAgentLabel, !cleanedAgentLabel.isEmpty {
+            if cleanedTitle == nil || cleanedTitle?.localizedCaseInsensitiveCompare("Conversation") == .orderedSame {
+                return cleanedAgentLabel
+            }
         }
 
         guard let cleanedTitle, !cleanedTitle.isEmpty else {
@@ -121,6 +214,86 @@ extension CodexThread {
         }
 
         return cleanedTitle
+    }
+
+    var isSubagent: Bool {
+        parentThreadId != nil
+    }
+
+    // Fork badges use ancestry rather than cwd heuristics so local/worktree routing stays independent.
+    var isForkedThread: Bool {
+        forkedFromThreadId != nil
+    }
+
+    var preferredSubagentLabel: String? {
+        guard isSubagent else { return nil }
+
+        if let agentDisplayLabel {
+            return agentDisplayLabel
+        }
+
+        for candidate in [name, title] {
+            guard let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !trimmed.isEmpty,
+                  trimmed.localizedCaseInsensitiveCompare("Conversation") != .orderedSame else {
+                continue
+            }
+            return trimmed
+        }
+
+        return nil
+    }
+
+    var derivedSubagentIdentity: (nickname: String?, role: String?)? {
+        guard let label = preferredSubagentLabel else {
+            return nil
+        }
+
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        guard trimmed.hasSuffix("]"),
+              let openBracket = trimmed.lastIndex(of: "[") else {
+            return (nickname: trimmed, role: nil)
+        }
+
+        let nickname = String(trimmed[..<openBracket]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let roleStart = trimmed.index(after: openBracket)
+        let roleEnd = trimmed.index(before: trimmed.endIndex)
+        let role = String(trimmed[roleStart..<roleEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return (
+            nickname: nickname.isEmpty ? nil : nickname,
+            role: role.isEmpty ? nil : role
+        )
+    }
+
+    var agentDisplayLabel: String? {
+        let nickname = Self.sanitizedAgentIdentity(agentNickname) ?? ""
+        let role = Self.sanitizedAgentIdentity(agentRole) ?? ""
+
+        if !nickname.isEmpty && !role.isEmpty {
+            return "\(nickname) [\(role)]"
+        }
+        if !nickname.isEmpty {
+            return nickname
+        }
+        if !role.isEmpty {
+            return role.capitalized
+        }
+        return nil
+    }
+
+    var modelDisplayLabel: String? {
+        if let provider = modelProvider?.trimmingCharacters(in: .whitespacesAndNewlines), !provider.isEmpty {
+            return provider
+        }
+        if let model = model?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            return model
+        }
+        return nil
     }
 
     // Normalized absolute project path used for stable grouping.
@@ -149,16 +322,34 @@ extension CodexThread {
 
     // User-facing project label shown in the sidebar section header.
     var projectDisplayName: String {
+        Self.projectDisplayLabel(for: normalizedProjectPath)
+    }
+
+    // Reuses the same worktree detection across the sidebar, toolbar, and composer affordances.
+    var isManagedWorktreeProject: Bool {
+        Self.projectIconSystemName(for: normalizedProjectPath) == "arrow.triangle.branch"
+    }
+
+    // Distinguishes Codex-managed worktrees from the main repo in compact sidebar UIs.
+    static func projectDisplayLabel(for normalizedProjectPath: String?) -> String {
         guard let normalizedProjectPath else {
-            return "No Project"
+            return "Cloud"
         }
 
-        let lastComponent = (normalizedProjectPath as NSString).lastPathComponent
-        if !lastComponent.isEmpty, lastComponent != "/" {
-            return lastComponent
+        let baseLabel = projectBaseDisplayName(for: normalizedProjectPath)
+        guard let worktreeToken = codexManagedWorktreeDisplayToken(for: normalizedProjectPath) else {
+            return baseLabel
         }
 
-        return normalizedProjectPath
+        return "\(baseLabel) \(worktreeToken)"
+    }
+
+    static func projectIconSystemName(for normalizedProjectPath: String?) -> String {
+        guard let normalizedProjectPath else {
+            return "cloud"
+        }
+
+        return codexManagedWorktreeToken(for: normalizedProjectPath) == nil ? "laptopcomputer" : "arrow.triangle.branch"
     }
 
     // --- Date parsing ---------------------------------------------------------
@@ -231,6 +422,50 @@ extension CodexThread {
         return nil
     }
 
+    private static func decodeThreadIdentity(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        metadata: [String: JSONValue]?,
+        keys: [CodingKeys],
+        metadataKeys: [String]
+    ) -> String? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(String.self, forKey: key),
+               let normalized = normalizeIdentifier(value) {
+                return normalized
+            }
+        }
+
+        for metadataKey in metadataKeys {
+            if let normalized = normalizeIdentifier(metadata?[metadataKey]?.stringValue) {
+                return normalized
+            }
+        }
+
+        return nil
+    }
+
+    private static func sanitizedAgentIdentity(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let lowered = trimmed.lowercased()
+        if lowered == "collabagenttoolcall" || lowered == "collabtoolcall" {
+            return nil
+        }
+
+        return trimmed
+    }
+
+    private static func normalizeIdentifier(_ value: String?) -> String? {
+        guard let value else {
+            return nil
+        }
+
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     private static func normalizeProjectPath(_ value: String?) -> String? {
         guard let value else {
             return nil
@@ -251,5 +486,39 @@ extension CodexThread {
         }
 
         return normalized.isEmpty ? "/" : normalized
+    }
+
+    private static func projectBaseDisplayName(for normalizedProjectPath: String) -> String {
+        let lastComponent = (normalizedProjectPath as NSString).lastPathComponent
+        if !lastComponent.isEmpty, lastComponent != "/" {
+            return lastComponent
+        }
+
+        return normalizedProjectPath
+    }
+
+    private static func codexManagedWorktreeToken(for normalizedProjectPath: String) -> String? {
+        let components = URL(fileURLWithPath: normalizedProjectPath).standardized.pathComponents
+        guard let worktreesIndex = components.firstIndex(of: "worktrees"),
+              worktreesIndex > 0,
+              components[worktreesIndex - 1] == ".codex" else {
+            return nil
+        }
+
+        let tokenIndex = components.index(after: worktreesIndex)
+        guard components.indices.contains(tokenIndex) else {
+            return nil
+        }
+
+        let token = components[tokenIndex].trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
+    }
+
+    private static func codexManagedWorktreeDisplayToken(for normalizedProjectPath: String) -> String? {
+        guard let token = codexManagedWorktreeToken(for: normalizedProjectPath) else {
+            return nil
+        }
+
+        return "[\(token)]"
     }
 }

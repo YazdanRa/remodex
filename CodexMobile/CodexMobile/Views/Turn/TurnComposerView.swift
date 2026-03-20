@@ -2,10 +2,9 @@
 // Purpose: Renders the turn composer input, queued-draft actions, attachments, and send/stop controls.
 // Layer: View Component (orchestrator)
 // Exports: TurnComposerView
-// Depends on: SwiftUI, ComposerAttachmentsPreview, FileAutocompletePanel, SkillAutocompletePanel, SlashCommandAutocompletePanel, ComposerBottomBar, QueuedDraftsPanel, FileMentionChip, TurnComposerInputTextView
+// Depends on: SwiftUI, ComposerAttachmentsPreview, FileAutocompletePanel, SkillAutocompletePanel, SlashCommandAutocompletePanel, ComposerBottomBar, QueuedDraftsPanel, FileMentionChip, TurnComposerInputTextView, TurnComposerSecondaryBar
 
 import SwiftUI
-import UIKit
 
 struct TurnComposerView: View {
     @Binding var input: String
@@ -21,6 +20,8 @@ struct TurnComposerView: View {
     let isQueuePaused: Bool
     let activeTurnID: String?
     let isThreadRunning: Bool
+    let isEmptyThread: Bool
+    let isWorktreeProject: Bool
 
     let orderedModelOptions: [CodexModelOption]
     let selectedModelID: String?
@@ -32,24 +33,33 @@ struct TurnComposerView: View {
 
     let selectedAccessMode: CodexAccessMode
     let contextWindowUsage: ContextWindowUsage?
+    let rateLimitBuckets: [CodexRateLimitBucket]
+    let isLoadingRateLimits: Bool
+    let rateLimitsErrorMessage: String?
+    let shouldAutoRefreshUsageStatus: Bool
 
     let showsGitBranchSelector: Bool
     let isGitBranchSelectorEnabled: Bool
     let availableGitBranchTargets: [String]
     let gitBranchesCheckedOutElsewhere: Set<String>
+    let gitWorktreePathsByBranch: [String: String]
     let selectedGitBaseBranch: String
     let currentGitBranch: String
     let gitDefaultBranch: String
     let isLoadingGitBranchTargets: Bool
     let isSwitchingGitBranch: Bool
+    let isCreatingGitWorktree: Bool
     let onSelectGitBranch: (String) -> Void
+    let onCreateGitBranch: (String) -> Void
     let onSelectGitBaseBranch: (String) -> Void
     let onRefreshGitBranches: () -> Void
-    let onRefreshContextWindowUsage: () async -> Void
+    let onRefreshUsageStatus: () async -> Void
 
     let onSelectAccessMode: (CodexAccessMode) -> Void
+    let canHandOffToWorktree: Bool
     let onTapAddImage: () -> Void
     let onTapTakePhoto: () -> Void
+    let onTapCreateWorktree: () -> Void
     let onSetPlanModeArmed: (Bool) -> Void
     let onRemoveAttachment: (String) -> Void
     let onStopTurn: (String?) -> Void
@@ -60,11 +70,15 @@ struct TurnComposerView: View {
     let onSelectSkillAutocomplete: (CodexSkillMetadata) -> Void
     let onSelectSlashCommand: (TurnComposerSlashCommand) -> Void
     let onSelectCodeReviewTarget: (TurnComposerReviewTarget) -> Void
+    let onSelectForkDestination: (TurnComposerForkDestination) -> Void
+    let onCloseSlashCommandPanel: () -> Void
     let onRemoveMentionedFile: (String) -> Void
     let onRemoveMentionedSkill: (String) -> Void
     let onRemoveComposerReviewSelection: () -> Void
+    let onRemoveComposerSubagentsSelection: () -> Void
     let onPasteImageData: ([Data]) -> Void
     let onResumeQueue: () -> Void
+    let onRestoreQueuedDraft: (String) -> Void
     let onSteerQueuedDraft: (String) -> Void
     let onRemoveQueuedDraft: (String) -> Void
     let onSend: () -> Void
@@ -74,19 +88,12 @@ struct TurnComposerView: View {
     // ─── ENTRY POINT ─────────────────────────────────────────────
     var body: some View {
         VStack(spacing: 6) {
-            TurnComposerAutocompletePanels(
-                state: autocompleteState,
-                onSelectFileAutocomplete: onSelectFileAutocomplete,
-                onSelectSkillAutocomplete: onSelectSkillAutocomplete,
-                onSelectSlashCommand: onSelectSlashCommand,
-                onSelectCodeReviewTarget: onSelectCodeReviewTarget,
-                onRemoveComposerReviewSelection: onRemoveComposerReviewSelection
-            )
-
             TurnComposerQueuedDraftsSection(
                 drafts: accessoryState.queuedDrafts,
                 canSteerDrafts: accessoryState.canSteerQueuedDrafts,
+                canRestoreDrafts: accessoryState.canRestoreQueuedDrafts,
                 steeringDraftID: accessoryState.steeringDraftID,
+                onRestoreQueuedDraft: onRestoreQueuedDraft,
                 onSteerQueuedDraft: onSteerQueuedDraft,
                 onRemoveQueuedDraft: onRemoveQueuedDraft
             )
@@ -97,7 +104,8 @@ struct TurnComposerView: View {
                     onRemoveAttachment: onRemoveAttachment,
                     onRemoveMentionedFile: onRemoveMentionedFile,
                     onRemoveMentionedSkill: onRemoveMentionedSkill,
-                    onRemoveComposerReviewSelection: onRemoveComposerReviewSelection
+                    onRemoveComposerReviewSelection: onRemoveComposerReviewSelection,
+                    onRemoveComposerSubagentsSelection: onRemoveComposerSubagentsSelection
                 )
 
                 ZStack(alignment: .topLeading) {
@@ -122,6 +130,7 @@ struct TurnComposerView: View {
                     )
                     .frame(height: composerInputHeight)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 16)
                 .padding(.top, accessoryState.topInputPadding)
                 .padding(.bottom, 12)
@@ -156,135 +165,63 @@ struct TurnComposerView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .adaptiveGlass(.regular, in: RoundedRectangle(cornerRadius: 28))
-
-            if !isInputFocused.wrappedValue {
-                // The secondary control row is nice to have, but when the keyboard is up
-                // it can become the first thing that gets clipped on shorter devices.
-                HStack(spacing: 0) {
-                    HStack(spacing: 14) {
-                        runtimePicker
-                        accessMenuLabel
-                    }
-
-                    Spacer(minLength: 0)
-
-                    if showsGitBranchSelector {
-                        HStack(spacing: 10) {
-                            TurnGitBranchSelector(
-                                isEnabled: isGitBranchSelectorEnabled,
-                                availableGitBranchTargets: availableGitBranchTargets,
-                                gitBranchesCheckedOutElsewhere: gitBranchesCheckedOutElsewhere,
-                                selectedGitBaseBranch: selectedGitBaseBranch,
-                                currentGitBranch: currentGitBranch,
-                                defaultBranch: gitDefaultBranch,
-                                isLoadingGitBranchTargets: isLoadingGitBranchTargets,
-                                isSwitchingGitBranch: isSwitchingGitBranch,
-                                onSelectGitBranch: onSelectGitBranch,
-                                onSelectGitBaseBranch: onSelectGitBaseBranch,
-                                onRefreshGitBranches: onRefreshGitBranches
-                            )
-
-                            ContextWindowProgressRing(
-                                usage: contextWindowUsage,
-                                onRefresh: onRefreshContextWindowUsage
-                            )
-                        }
-                    } else {
-                        ContextWindowProgressRing(
-                            usage: contextWindowUsage,
-                            onRefresh: onRefreshContextWindowUsage
+            .overlay(alignment: .topLeading) {
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: 0, alignment: .topLeading)
+                    .overlay(alignment: .bottomLeading) {
+                        TurnComposerAutocompletePanels(
+                            state: autocompleteState,
+                            onSelectFileAutocomplete: onSelectFileAutocomplete,
+                            onSelectSkillAutocomplete: onSelectSkillAutocomplete,
+                            onSelectSlashCommand: onSelectSlashCommand,
+                            onSelectCodeReviewTarget: onSelectCodeReviewTarget,
+                            onSelectForkDestination: onSelectForkDestination,
+                            onCloseSlashCommandPanel: onCloseSlashCommandPanel
                         )
                     }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .adaptiveGlass(.regular, in: Capsule())
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .offset(y: -8)
             }
+            .zIndex(2)
+
+            // Kept as a separate component so the lower meta bar can evolve without reopening this file.
+            TurnComposerSecondaryBar(
+                isInputFocused: isInputFocused.wrappedValue,
+                isEmptyThread: isEmptyThread,
+                isWorktreeProject: isWorktreeProject,
+                selectedAccessMode: selectedAccessMode,
+                contextWindowUsage: contextWindowUsage,
+                rateLimitBuckets: rateLimitBuckets,
+                isLoadingRateLimits: isLoadingRateLimits,
+                rateLimitsErrorMessage: rateLimitsErrorMessage,
+                shouldAutoRefreshUsageStatus: shouldAutoRefreshUsageStatus,
+                showsGitBranchSelector: showsGitBranchSelector,
+                isGitBranchSelectorEnabled: isGitBranchSelectorEnabled,
+                availableGitBranchTargets: availableGitBranchTargets,
+                gitBranchesCheckedOutElsewhere: gitBranchesCheckedOutElsewhere,
+                gitWorktreePathsByBranch: gitWorktreePathsByBranch,
+                selectedGitBaseBranch: selectedGitBaseBranch,
+                currentGitBranch: currentGitBranch,
+                gitDefaultBranch: gitDefaultBranch,
+                isLoadingGitBranchTargets: isLoadingGitBranchTargets,
+                isSwitchingGitBranch: isSwitchingGitBranch,
+                isCreatingGitWorktree: isCreatingGitWorktree,
+                onSelectGitBranch: onSelectGitBranch,
+                onCreateGitBranch: onCreateGitBranch,
+                onSelectGitBaseBranch: onSelectGitBaseBranch,
+                onRefreshGitBranches: onRefreshGitBranches,
+                onRefreshUsageStatus: onRefreshUsageStatus,
+                onSelectAccessMode: onSelectAccessMode,
+                canHandOffToWorktree: canHandOffToWorktree,
+                onTapCreateWorktree: onTapCreateWorktree
+            )
         }
         .padding(.horizontal, 12)
         .padding(.top, 6)
         .padding(.bottom, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .animation(.easeInOut(duration: 0.18), value: isInputFocused.wrappedValue)
     }
 
-    // MARK: - Below-card controls
-
-    private var accessMenuLabel: some View {
-        Menu {
-            ForEach(CodexAccessMode.allCases, id: \.rawValue) { mode in
-                Button {
-                    HapticFeedback.shared.triggerImpactFeedback(style: .light)
-                    onSelectAccessMode(mode)
-                } label: {
-                    if selectedAccessMode == mode {
-                        Label(mode.displayName, systemImage: "checkmark")
-                    } else {
-                        Text(mode.displayName)
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: selectedAccessMode == .fullAccess
-                      ? "exclamationmark.shield"
-                      : "checkmark.shield")
-                    .font(branchTextFont)
-
-                Text(selectedAccessMode.displayName)
-                    .font(branchTextFont)
-                    .fontWeight(.regular)
-                    .lineLimit(1)
-
-                Image(systemName: "chevron.down")
-                    .font(branchChevronFont)
-            }
-            .foregroundStyle(selectedAccessMode == .fullAccess ? .orange : branchLabelColor)
-            .contentShape(Rectangle())
-        }
-        .tint(branchLabelColor)
-    }
-
-    // MARK: - Runtime controls
-
-    private var runtimePicker: some View {
-        Menu {
-            Button {
-                // Already on Local — no-op.
-            } label: {
-                Label("Local", systemImage: "checkmark")
-            }
-
-            Button {
-                HapticFeedback.shared.triggerImpactFeedback(style: .light)
-                if let url = URL(string: "https://chatgpt.com/codex") {
-                    UIApplication.shared.open(url)
-                }
-            } label: {
-                Text("Cloud")
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "laptopcomputer")
-                    .font(branchTextFont)
-
-                Text("Local")
-                    .font(branchTextFont)
-                    .fontWeight(.regular)
-                    .lineLimit(1)
-
-                Image(systemName: "chevron.down")
-                    .font(branchChevronFont)
-            }
-            .foregroundStyle(branchLabelColor)
-            .contentShape(Rectangle())
-        }
-        .tint(branchLabelColor)
-    }
-
-    private let branchLabelColor = Color(.secondaryLabel)
-    private var branchTextFont: Font { AppFont.subheadline() }
-    private var branchChevronFont: Font { AppFont.system(size: 9, weight: .regular) }
 }
 
 private struct TurnComposerAutocompletePanels: View {
@@ -293,10 +230,11 @@ private struct TurnComposerAutocompletePanels: View {
     let onSelectSkillAutocomplete: (CodexSkillMetadata) -> Void
     let onSelectSlashCommand: (TurnComposerSlashCommand) -> Void
     let onSelectCodeReviewTarget: (TurnComposerReviewTarget) -> Void
-    let onRemoveComposerReviewSelection: () -> Void
+    let onSelectForkDestination: (TurnComposerForkDestination) -> Void
+    let onCloseSlashCommandPanel: () -> Void
 
     var body: some View {
-        Group {
+        VStack(alignment: .leading, spacing: 0) {
             if state.isFileAutocompleteVisible {
                 FileAutocompletePanel(
                     items: state.fileAutocompleteItems,
@@ -318,24 +256,33 @@ private struct TurnComposerAutocompletePanels: View {
             if state.slashCommandPanelState != .hidden {
                 SlashCommandAutocompletePanel(
                     state: state.slashCommandPanelState,
+                    availableCommands: state.availableSlashCommands,
                     hasComposerContentConflictingWithReview: state.hasComposerContentConflictingWithReview,
+                    isThreadRunning: state.isThreadRunning,
                     showsGitBranchSelector: state.showsGitBranchSelector,
                     isLoadingGitBranchTargets: state.isLoadingGitBranchTargets,
                     selectedGitBaseBranch: state.selectedGitBaseBranch,
                     gitDefaultBranch: state.gitDefaultBranch,
                     onSelectCommand: onSelectSlashCommand,
                     onSelectReviewTarget: onSelectCodeReviewTarget,
-                    onClose: onRemoveComposerReviewSelection
+                    onSelectForkDestination: onSelectForkDestination,
+                    onClose: onCloseSlashCommandPanel
                 )
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+        .layoutPriority(1)
+        .zIndex(1)
     }
 }
 
 private struct TurnComposerQueuedDraftsSection: View {
     let drafts: [QueuedTurnDraft]
     let canSteerDrafts: Bool
+    let canRestoreDrafts: Bool
     let steeringDraftID: String?
+    let onRestoreQueuedDraft: (String) -> Void
     let onSteerQueuedDraft: (String) -> Void
     let onRemoveQueuedDraft: (String) -> Void
 
@@ -345,7 +292,9 @@ private struct TurnComposerQueuedDraftsSection: View {
                 QueuedDraftsPanel(
                     drafts: drafts,
                     canSteerDrafts: canSteerDrafts,
+                    canRestoreDrafts: canRestoreDrafts,
                     steeringDraftID: steeringDraftID,
+                    onRestore: onRestoreQueuedDraft,
                     onSteer: onSteerQueuedDraft,
                     onRemove: onRemoveQueuedDraft
                 )
@@ -371,6 +320,7 @@ private struct TurnComposerAccessorySection: View {
     let onRemoveMentionedFile: (String) -> Void
     let onRemoveMentionedSkill: (String) -> Void
     let onRemoveComposerReviewSelection: () -> Void
+    let onRemoveComposerSubagentsSelection: () -> Void
 
     var body: some View {
         Group {
@@ -414,10 +364,33 @@ private struct TurnComposerAccessorySection: View {
                 .padding(.top, 8)
             }
 
+            if state.showsSubagentsSelection {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ComposerActionChip(
+                            title: "Subagents",
+                            symbolName: "person.crop.circle",
+                            tintColor: .teal,
+                            removeAccessibilityLabel: "Remove subagents"
+                        ) {
+                            onRemoveComposerSubagentsSelection()
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+            }
+
             if let reviewTarget = state.reviewTarget {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        ReviewMentionChip(title: "Code Review: \(reviewTarget.title)") {
+                        ComposerActionChip(
+                            title: "Code Review: \(reviewTarget.title)",
+                            symbolName: "checklist",
+                            tintColor: .teal,
+                            removeAccessibilityLabel: "Remove code review"
+                        ) {
                             onRemoveComposerReviewSelection()
                         }
                     }
@@ -426,6 +399,7 @@ private struct TurnComposerAccessorySection: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
             }
+
         }
     }
 }
@@ -454,13 +428,16 @@ private struct QueuedDraftsPanelPreviewWrapper: View {
                 accessoryState: TurnComposerAccessoryState(
                     queuedDrafts: fakeDrafts,
                     canSteerQueuedDrafts: true,
+                    canRestoreQueuedDrafts: true,
                     steeringDraftID: nil,
                     composerAttachments: [],
                     composerMentionedFiles: [],
                     composerMentionedSkills: [],
-                    composerReviewSelection: nil
+                    composerReviewSelection: nil,
+                    isSubagentsSelectionArmed: true
                 ),
                 autocompleteState: TurnComposerAutocompleteState(
+                    availableSlashCommands: TurnComposerSlashCommand.allCommands,
                     fileAutocompleteItems: [],
                     isFileAutocompleteVisible: false,
                     isFileAutocompleteLoading: false,
@@ -471,6 +448,7 @@ private struct QueuedDraftsPanelPreviewWrapper: View {
                     skillAutocompleteQuery: "",
                     slashCommandPanelState: .hidden,
                     hasComposerContentConflictingWithReview: false,
+                    isThreadRunning: true,
                     showsGitBranchSelector: false,
                     isLoadingGitBranchTargets: false,
                     selectedGitBaseBranch: "",
@@ -484,6 +462,8 @@ private struct QueuedDraftsPanelPreviewWrapper: View {
                 isQueuePaused: false,
                 activeTurnID: nil,
                 isThreadRunning: true,
+                isEmptyThread: true,
+                isWorktreeProject: false,
                 orderedModelOptions: [],
                 selectedModelID: nil,
                 selectedModelTitle: "GPT-5.3-Codex",
@@ -503,22 +483,31 @@ private struct QueuedDraftsPanelPreviewWrapper: View {
                 ),
                 selectedAccessMode: .onRequest,
                 contextWindowUsage: nil,
+                rateLimitBuckets: [],
+                isLoadingRateLimits: false,
+                rateLimitsErrorMessage: nil,
+                shouldAutoRefreshUsageStatus: false,
                 showsGitBranchSelector: false,
                 isGitBranchSelectorEnabled: false,
                 availableGitBranchTargets: [],
                 gitBranchesCheckedOutElsewhere: [],
+                gitWorktreePathsByBranch: [:],
                 selectedGitBaseBranch: "",
                 currentGitBranch: "main",
                 gitDefaultBranch: "main",
                 isLoadingGitBranchTargets: false,
                 isSwitchingGitBranch: false,
+                isCreatingGitWorktree: false,
                 onSelectGitBranch: { _ in },
+                onCreateGitBranch: { _ in },
                 onSelectGitBaseBranch: { _ in },
                 onRefreshGitBranches: {},
-                onRefreshContextWindowUsage: {},
+                onRefreshUsageStatus: {},
                 onSelectAccessMode: { _ in },
+                canHandOffToWorktree: false,
                 onTapAddImage: {},
                 onTapTakePhoto: {},
+                onTapCreateWorktree: {},
                 onSetPlanModeArmed: { _ in },
                 onRemoveAttachment: { _ in },
                 onStopTurn: { _ in },
@@ -529,11 +518,15 @@ private struct QueuedDraftsPanelPreviewWrapper: View {
                 onSelectSkillAutocomplete: { _ in },
                 onSelectSlashCommand: { _ in },
                 onSelectCodeReviewTarget: { _ in },
+                onSelectForkDestination: { _ in },
+                onCloseSlashCommandPanel: {},
                 onRemoveMentionedFile: { _ in },
                 onRemoveMentionedSkill: { _ in },
                 onRemoveComposerReviewSelection: {},
+                onRemoveComposerSubagentsSelection: {},
                 onPasteImageData: { _ in },
                 onResumeQueue: {},
+                onRestoreQueuedDraft: { _ in },
                 onSteerQueuedDraft: { _ in },
                 onRemoveQueuedDraft: { _ in },
                 onSend: {}

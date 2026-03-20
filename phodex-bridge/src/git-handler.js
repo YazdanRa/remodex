@@ -2,10 +2,13 @@
 // Purpose: Intercepts git/* JSON-RPC methods and executes git commands locally on the Mac.
 // Layer: Bridge handler
 // Exports: handleGitRequest
-// Depends on: child_process, fs
+// Depends on: child_process, fs, os, path, crypto
 
 const { execFile } = require("child_process");
 const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { randomBytes } = require("crypto");
 const { promisify } = require("util");
 
 const execFileAsync = promisify(execFile);
@@ -78,6 +81,10 @@ async function handleGitMethod(method, params) {
       return gitLog(cwd);
     case "git/createBranch":
       return gitCreateBranch(cwd, params);
+    case "git/createWorktree":
+      return gitCreateWorktree(cwd, params);
+    case "git/removeWorktree":
+      return gitRemoveWorktree(cwd, params);
     case "git/stash":
       return gitStash(cwd);
     case "git/stashPop":
@@ -117,6 +124,8 @@ async function gitStatus(cwd) {
   const { ahead, behind } = branchInfo;
   const detached = branchLine.includes("HEAD detached") || branchLine.includes("no branch");
   const noUpstream = tracking === null && !detached;
+  const publishedToRemote = !detached && !!branch && await remoteBranchExists(cwd, branch).catch(() => false);
+  const localOnlyCommitCount = await countLocalOnlyCommits(cwd, { detached }).catch(() => 0);
   const state = computeState(dirty, ahead, behind, detached, noUpstream);
   const canPush = (ahead > 0 || noUpstream) && !detached;
   const diff = await repoDiffTotals(cwd, {
@@ -124,7 +133,20 @@ async function gitStatus(cwd) {
     fileLines,
   }).catch(() => ({ additions: 0, deletions: 0, binaryFiles: 0 }));
 
-  return { repoRoot, branch, tracking, dirty, ahead, behind, state, canPush, files, diff };
+  return {
+    repoRoot,
+    branch,
+    tracking,
+    dirty,
+    ahead,
+    behind,
+    localOnlyCommitCount,
+    state,
+    canPush,
+    publishedToRemote,
+    files,
+    diff,
+  };
 }
 
 // ─── Git Diff ─────────────────────────────────────────────────
@@ -227,7 +249,14 @@ async function gitPull(cwd) {
 // ─── Git Branches ─────────────────────────────────────────────
 
 async function gitBranches(cwd) {
-  const output = await git(cwd, "branch", "-a", "--no-color");
+  const [output, repoRoot, localCheckoutRoot] = await Promise.all([
+    git(cwd, "branch", "--no-color"),
+    resolveRepoRoot(cwd).catch(() => null),
+    resolveLocalCheckoutRoot(cwd).catch(() => null),
+  ]);
+  const projectRelativePath = resolveProjectRelativePath(cwd, repoRoot);
+  const worktreePathByBranch = await gitWorktreePathByBranch(cwd, { projectRelativePath }).catch(() => ({}));
+  const localCheckoutPath = scopedLocalCheckoutPath(localCheckoutRoot || repoRoot, projectRelativePath);
   const lines = output
     .trim()
     .split("\n")
@@ -250,16 +279,9 @@ async function gitBranches(cwd) {
       continue;
     }
 
-    // Skip remotes/origin/HEAD -> ...
-    if (name.includes("->")) continue;
-
-    if (name.startsWith("remotes/origin/")) {
-      branchSet.add(name.replace("remotes/origin/", ""));
-    } else {
-      branchSet.add(name);
-      if (isCheckedOutElsewhere) {
-        branchesCheckedOutElsewhere.add(name);
-      }
+    branchSet.add(name);
+    if (isCheckedOutElsewhere) {
+      branchesCheckedOutElsewhere.add(name);
     }
 
     if (isCurrent) current = name;
@@ -271,6 +293,8 @@ async function gitBranches(cwd) {
   return {
     branches,
     branchesCheckedOutElsewhere: [...branchesCheckedOutElsewhere].sort(),
+    worktreePathByBranch,
+    localCheckoutPath,
     current,
     default: defaultBranch,
   };
@@ -336,9 +360,18 @@ async function gitLog(cwd) {
 // ─── Git Create Branch ────────────────────────────────────────
 
 async function gitCreateBranch(cwd, params) {
-  const name = typeof params.name === "string" ? params.name.trim() : "";
+  const name = normalizeCreatedBranchName(params.name);
   if (!name) {
     throw gitError("missing_branch_name", "Branch name is required.");
+  }
+  await assertValidCreatedBranchName(cwd, name);
+
+  // Keep create-branch local-first so we never fork history under a remote-only name.
+  if (!(await localBranchExists(cwd, name)) && await remoteBranchExists(cwd, name)) {
+    throw gitError(
+      "branch_exists",
+      `Branch '${name}' already exists on origin. Check it out locally instead of creating a new branch.`
+    );
   }
 
   try {
@@ -352,6 +385,146 @@ async function gitCreateBranch(cwd, params) {
 
   const status = await gitStatus(cwd);
   return { branch: name, status };
+}
+
+async function gitCreateWorktree(cwd, params) {
+  const branch = normalizeCreatedBranchName(params.name);
+  if (!branch) {
+    throw gitError("missing_branch_name", "Branch name is required.");
+  }
+  await assertValidCreatedBranchName(cwd, branch);
+
+  const branchResult = await gitBranches(cwd);
+  const repoRoot = await resolveRepoRoot(cwd);
+  const status = await gitStatus(cwd);
+  const projectRelativePath = resolveProjectRelativePath(cwd, repoRoot);
+  const baseBranch = resolveBaseBranchName(params.baseBranch, branchResult.defaultBranch);
+  const changeTransfer = resolveWorktreeChangeTransfer(params.changeTransfer);
+  if (!baseBranch) {
+    throw gitError("missing_base_branch", "Base branch is required.");
+  }
+  if (!(await localBranchExists(cwd, baseBranch))) {
+    throw gitError(
+      "missing_base_branch",
+      `Base branch '${baseBranch}' is not available locally. Create or check out that branch first.`
+    );
+  }
+
+  const currentBranch = typeof status.branch === "string" ? status.branch.trim() : "";
+  const canCarryLocalChanges = status.dirty && !!currentBranch && currentBranch === baseBranch;
+  if (status.dirty && !canCarryLocalChanges) {
+    const currentBranchLabel = currentBranch || "the current branch";
+    const transferVerb = changeTransfer === "copy" ? "copy" : "move";
+    throw gitError(
+      "dirty_worktree_base_mismatch",
+      `Uncommitted changes can ${transferVerb} into a new worktree only from ${currentBranchLabel}. Switch the base branch to match or clean up local changes first.`
+    );
+  }
+
+  const existingWorktreePath = branchResult.worktreePathByBranch[branch];
+  if (existingWorktreePath) {
+    if (sameFilePath(existingWorktreePath, cwd)) {
+      throw gitError(
+        "branch_already_open_here",
+        `Branch '${branch}' is already open in this project.`
+      );
+    }
+
+    return {
+      branch,
+      worktreePath: existingWorktreePath,
+      alreadyExisted: true,
+    };
+  }
+
+  const branchExists = await localBranchExists(cwd, branch);
+  if (branchExists) {
+    throw gitError(
+      "branch_exists",
+      `Branch '${branch}' already exists locally. Choose another name or open that branch instead.`
+    );
+  }
+
+  const worktreeRootPath = allocateManagedWorktreePath(repoRoot);
+  let handoffStashRef = null;
+  let copiedLocalChangesPatch = "";
+  let didCreateWorktree = false;
+
+  try {
+    if (canCarryLocalChanges) {
+      if (changeTransfer === "copy") {
+        copiedLocalChangesPatch = await captureLocalChangesPatch(repoRoot);
+      } else {
+        handoffStashRef = await stashChangesForWorktreeHandoff(repoRoot);
+      }
+    }
+
+    await git(repoRoot, "worktree", "add", "-b", branch, worktreeRootPath, baseBranch);
+    didCreateWorktree = true;
+
+    if (handoffStashRef) {
+      await applyWorktreeHandoffStash(worktreeRootPath, handoffStashRef);
+    }
+    if (copiedLocalChangesPatch) {
+      await applyCopiedLocalChangesToWorktree(worktreeRootPath, copiedLocalChangesPatch);
+    }
+  } catch (err) {
+    if (didCreateWorktree) {
+      await cleanupManagedWorktree(repoRoot, worktreeRootPath, branch);
+    } else {
+      fs.rmSync(path.dirname(worktreeRootPath), { recursive: true, force: true });
+    }
+
+    if (handoffStashRef) {
+      await restoreWorktreeHandoffStash(repoRoot, handoffStashRef);
+    }
+
+    if (err.message?.includes("invalid reference")) {
+      throw gitError("missing_base_branch", `Base branch '${baseBranch}' does not exist.`);
+    }
+    if (err.message?.includes("already exists")) {
+      throw gitError("branch_exists", `Branch '${branch}' already exists.`);
+    }
+    if (err.message?.includes("already used by worktree") || err.message?.includes("already checked out at")) {
+      throw gitError(
+        "branch_in_other_worktree",
+        `Branch '${branch}' is already open in another worktree.`
+      );
+    }
+    throw gitError("create_worktree_failed", err.message || "Failed to create worktree.");
+  }
+
+  const worktreePath = scopedWorktreePath(worktreeRootPath, projectRelativePath);
+  return {
+    branch,
+    worktreePath,
+    alreadyExisted: false,
+  };
+}
+
+async function gitRemoveWorktree(cwd, params) {
+  const worktreeRootPath = await resolveRepoRoot(cwd).catch(() => null);
+  const localCheckoutRoot = await resolveLocalCheckoutRoot(cwd).catch(() => null);
+  const branch = typeof params.branch === "string" ? params.branch.trim() : "";
+
+  if (!worktreeRootPath || !localCheckoutRoot) {
+    throw gitError("missing_working_directory", "Could not resolve the worktree roots for cleanup.");
+  }
+  if (sameFilePath(worktreeRootPath, localCheckoutRoot)) {
+    throw gitError("cannot_remove_local_checkout", "Cannot remove the main local checkout.");
+  }
+  if (!isManagedWorktreePath(worktreeRootPath)) {
+    throw gitError("unmanaged_worktree", "Only managed worktrees can be removed automatically.");
+  }
+
+  await cleanupManagedWorktree(localCheckoutRoot, worktreeRootPath, branch || null);
+  if (branch && await localBranchExists(localCheckoutRoot, branch)) {
+    throw gitError(
+      "worktree_cleanup_failed",
+      `The temporary worktree was removed, but branch '${branch}' could not be deleted automatically.`
+    );
+  }
+  return { success: true };
 }
 
 // ─── Git Stash ────────────────────────────────────────────────
@@ -425,6 +598,149 @@ async function gitBranchesWithStatus(cwd) {
   return { ...branchResult, status: statusResult };
 }
 
+async function gitWorktreePathByBranch(cwd, options = {}) {
+  const output = await git(cwd, "worktree", "list", "--porcelain");
+  return parseWorktreePathByBranch(output, options);
+}
+
+async function stashChangesForWorktreeHandoff(cwd) {
+  const stashLabel = `remodex-worktree-handoff-${randomBytes(6).toString("hex")}`;
+  const output = await git(cwd, "stash", "push", "--include-untracked", "--message", stashLabel);
+  if (output.includes("No local changes")) {
+    return null;
+  }
+
+  const stashRef = await findStashRefByLabel(cwd, stashLabel);
+  if (!stashRef) {
+    throw gitError("create_worktree_failed", "Could not prepare local changes for the worktree handoff.");
+  }
+
+  return stashRef;
+}
+
+async function captureLocalChangesPatch(cwd) {
+  const trackedPatch = await git(cwd, "diff", "--binary", "--find-renames", "HEAD");
+  const porcelain = await git(cwd, "status", "--porcelain=v1");
+  const untrackedPaths = porcelain
+    .trim()
+    .split("\n")
+    .filter((line) => line.startsWith("?? "))
+    .map((line) => line.substring(3).trim())
+    .filter(Boolean);
+  const untrackedPatch = await diffPatchForUntrackedFiles(cwd, untrackedPaths);
+  return [trackedPatch, untrackedPatch]
+    .filter((patch) => typeof patch === "string" && patch.trim())
+    .map(ensureTrailingNewline)
+    .join("\n");
+}
+
+async function findStashRefByLabel(cwd, stashLabel) {
+  const output = await git(cwd, "stash", "list", "--format=%gd%x00%s");
+  const records = output
+    .trim()
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const record of records) {
+    const [ref, summary] = record.split("\0");
+    if (ref && summary?.includes(stashLabel)) {
+      return ref.trim();
+    }
+  }
+
+  return null;
+}
+
+async function applyWorktreeHandoffStash(cwd, stashRef) {
+  try {
+    await git(cwd, "stash", "pop", stashRef);
+  } catch (err) {
+    throw gitError(
+      "create_worktree_failed",
+      err.message || "Could not apply local changes in the new worktree."
+    );
+  }
+}
+
+async function applyCopiedLocalChangesToWorktree(cwd, patch) {
+  if (!patch.trim()) {
+    return;
+  }
+
+  const patchFilePath = path.join(os.tmpdir(), `remodex-worktree-copy-${randomBytes(6).toString("hex")}.patch`);
+  fs.writeFileSync(patchFilePath, ensureTrailingNewline(patch), "utf8");
+
+  try {
+    await git(cwd, "apply", "--binary", "--whitespace=nowarn", patchFilePath);
+  } catch (err) {
+    throw gitError(
+      "create_worktree_failed",
+      err.message || "Could not copy local changes into the new worktree."
+    );
+  } finally {
+    fs.rmSync(patchFilePath, { force: true });
+  }
+}
+
+async function restoreWorktreeHandoffStash(cwd, stashRef) {
+  try {
+    await git(cwd, "stash", "pop", stashRef);
+  } catch {
+    // Best effort: if restore fails we prefer surfacing the original worktree error without masking it.
+  }
+}
+
+async function cleanupManagedWorktree(repoRoot, worktreeRootPath, branchName = null) {
+  try {
+    await git(repoRoot, "worktree", "remove", "--force", worktreeRootPath);
+  } catch {
+    // Fall back to directory cleanup below.
+  }
+
+  if (branchName) {
+    try {
+      await git(repoRoot, "branch", "-D", branchName);
+    } catch {
+      // Best effort: leave the branch around if Git refuses deletion for any reason.
+    }
+  }
+
+  fs.rmSync(path.dirname(worktreeRootPath), { recursive: true, force: true });
+}
+
+function parseWorktreePathByBranch(output, options = {}) {
+  const worktreePathByBranch = {};
+  const records = typeof output === "string" ? output.split("\n\n") : [];
+  const projectRelativePath = typeof options.projectRelativePath === "string"
+    ? options.projectRelativePath
+    : "";
+
+  for (const record of records) {
+    const lines = record
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (!lines.length) {
+      continue;
+    }
+
+    const worktreeLine = lines.find((line) => line.startsWith("worktree "));
+    const branchLine = lines.find((line) => line.startsWith("branch "));
+    const worktreePath = worktreeLine?.slice("worktree ".length).trim();
+    const branchName = normalizeWorktreeBranchRef(branchLine?.slice("branch ".length).trim());
+
+    if (!worktreePath || !branchName) {
+      continue;
+    }
+
+    worktreePathByBranch[branchName] = scopedWorktreePath(worktreePath, projectRelativePath);
+  }
+
+  return worktreePathByBranch;
+}
+
 // Normalizes `git branch` output so the UI never sees worktree markers like `+ main`.
 function normalizeBranchListEntry(rawLine) {
   const trimmed = typeof rawLine === "string" ? rawLine.trim() : "";
@@ -441,6 +757,173 @@ function normalizeBranchListEntry(rawLine) {
   }
 
   return { isCurrent, isCheckedOutElsewhere, name };
+}
+
+function normalizeWorktreeBranchRef(rawRef) {
+  const trimmed = typeof rawRef === "string" ? rawRef.trim() : "";
+  if (!trimmed.startsWith("refs/heads/")) {
+    return null;
+  }
+
+  const branchName = trimmed.slice("refs/heads/".length).trim();
+  return branchName || null;
+}
+
+function normalizeCreatedBranchName(rawName) {
+  const trimmed = typeof rawName === "string" ? rawName.trim() : "";
+  if (!trimmed) {
+    return "";
+  }
+
+  // Keep slash-separated branch groups, but normalize user-entered whitespace into Git-friendly dashes.
+  const normalized = trimmed
+    .split("/")
+    .map((segment) => segment.trim().replace(/\s+/g, "-"))
+    .join("/");
+
+  if (normalized.startsWith("remodex/")) {
+    return normalized;
+  }
+  return `remodex/${normalized}`;
+}
+
+function resolveBaseBranchName(rawBaseBranch, fallbackBranch) {
+  const trimmedBaseBranch = typeof rawBaseBranch === "string" ? rawBaseBranch.trim() : "";
+  if (trimmedBaseBranch) {
+    return trimmedBaseBranch;
+  }
+
+  return typeof fallbackBranch === "string" && fallbackBranch.trim() ? fallbackBranch.trim() : "";
+}
+
+// Mirrors Codex-managed worktree paths under CODEX_HOME/worktrees/<token>/<repo>.
+function allocateManagedWorktreePath(repoRoot) {
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  const worktreesRoot = path.join(codexHome, "worktrees");
+  fs.mkdirSync(worktreesRoot, { recursive: true });
+
+  const repoName = path.basename(repoRoot) || "repo";
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const token = randomBytes(2).toString("hex");
+    const tokenDirectory = path.join(worktreesRoot, token);
+    const worktreePath = path.join(tokenDirectory, repoName);
+    if (fs.existsSync(tokenDirectory) || fs.existsSync(worktreePath)) {
+      continue;
+    }
+    fs.mkdirSync(tokenDirectory, { recursive: true });
+    return worktreePath;
+  }
+
+  throw gitError("create_worktree_failed", "Could not allocate a managed worktree path.");
+}
+
+async function localBranchExists(cwd, branchName) {
+  try {
+    await git(cwd, "show-ref", "--verify", "--quiet", `refs/heads/${branchName}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function assertValidCreatedBranchName(cwd, branchName) {
+  try {
+    await git(cwd, "check-ref-format", "--branch", branchName);
+  } catch {
+    throw gitError("invalid_branch_name", `Branch '${branchName}' is not a valid Git branch name.`);
+  }
+}
+
+// Keeps branch creation local-only even when a same-named ref exists on origin.
+async function remoteBranchExists(cwd, branchName) {
+  try {
+    await git(cwd, "show-ref", "--verify", "--quiet", `refs/remotes/origin/${branchName}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sameFilePath(leftPath, rightPath) {
+  const normalizedLeft = normalizeExistingPath(leftPath);
+  const normalizedRight = normalizeExistingPath(rightPath);
+  return normalizedLeft !== null && normalizedLeft === normalizedRight;
+}
+
+function normalizeExistingPath(candidatePath) {
+  if (typeof candidatePath !== "string") {
+    return null;
+  }
+
+  const trimmedPath = candidatePath.trim();
+  if (!trimmedPath) {
+    return null;
+  }
+
+  try {
+    return fs.realpathSync.native(trimmedPath);
+  } catch {
+    return path.resolve(trimmedPath);
+  }
+}
+
+function managedWorktreesRoot() {
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  return normalizeExistingPath(path.join(codexHome, "worktrees"));
+}
+
+function isManagedWorktreePath(candidatePath) {
+  const normalizedCandidate = normalizeExistingPath(candidatePath);
+  const normalizedRoot = managedWorktreesRoot();
+  if (!normalizedCandidate || !normalizedRoot) {
+    return false;
+  }
+
+  const relativePath = path.relative(normalizedRoot, normalizedCandidate);
+  return !!relativePath && relativePath !== "." && !relativePath.startsWith("..") && !path.isAbsolute(relativePath);
+}
+
+function resolveProjectRelativePath(cwd, repoRoot) {
+  const normalizedCwd = normalizeExistingPath(cwd);
+  const normalizedRepoRoot = normalizeExistingPath(repoRoot);
+  if (!normalizedCwd || !normalizedRepoRoot) {
+    return "";
+  }
+
+  const relativePath = path.relative(normalizedRepoRoot, normalizedCwd);
+  if (!relativePath || relativePath === ".") {
+    return "";
+  }
+
+  return relativePath;
+}
+
+// Preserves package-scoped threads by reopening the matching subpath inside sibling worktrees.
+function scopedWorktreePath(worktreeRootPath, projectRelativePath) {
+  const normalizedWorktreeRootPath = normalizeExistingPath(worktreeRootPath);
+  if (!normalizedWorktreeRootPath) {
+    return worktreeRootPath;
+  }
+  if (!projectRelativePath) {
+    return normalizedWorktreeRootPath;
+  }
+
+  const candidatePath = path.join(normalizedWorktreeRootPath, projectRelativePath);
+  return isExistingDirectory(candidatePath) ? normalizeExistingPath(candidatePath) ?? candidatePath : normalizedWorktreeRootPath;
+}
+
+// Resolves a Local checkout path only when the matching subpath actually exists there.
+function scopedLocalCheckoutPath(checkoutRootPath, projectRelativePath) {
+  const normalizedCheckoutRootPath = normalizeExistingPath(checkoutRootPath);
+  if (!normalizedCheckoutRootPath) {
+    return null;
+  }
+  if (!projectRelativePath) {
+    return normalizedCheckoutRootPath;
+  }
+
+  const candidatePath = path.join(normalizedCheckoutRootPath, projectRelativePath);
+  return isExistingDirectory(candidatePath) ? normalizeExistingPath(candidatePath) ?? candidatePath : null;
 }
 
 // Computes the local repo delta that still exists on this machine and is not on the remote.
@@ -519,6 +1002,28 @@ async function diffTotalsForUntrackedFiles(cwd, filePaths) {
   );
 }
 
+// Counts commits reachable from HEAD that are not present on any remote ref.
+async function countLocalOnlyCommits(cwd, context) {
+  if (context.detached) {
+    return 0;
+  }
+
+  const remoteRefs = await git(cwd, "for-each-ref", "--format=%(refname)", "refs/remotes");
+  const hasAnyRemoteRefs = remoteRefs
+    .trim()
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .length > 0;
+
+  if (!hasAnyRemoteRefs) {
+    return 0;
+  }
+
+  const output = await git(cwd, "rev-list", "--count", "HEAD", "--not", "--remotes");
+  return Number.parseInt(output.trim(), 10) || 0;
+}
+
 function parseNumstatTotals(output) {
   return output
     .trim()
@@ -539,6 +1044,15 @@ function parseNumstatTotals(output) {
       },
       { additions: 0, deletions: 0, binaryFiles: 0 }
     );
+}
+
+function resolveWorktreeChangeTransfer(rawValue) {
+  const normalizedValue = typeof rawValue === "string" ? rawValue.trim().toLowerCase() : "";
+  return normalizedValue === "copy" ? "copy" : "move";
+}
+
+function ensureTrailingNewline(value) {
+  return value.endsWith("\n") ? value : `${value}\n`;
 }
 
 async function gitDiffNoIndexNumstat(cwd, filePath) {
@@ -635,12 +1149,17 @@ async function detectDefaultBranch(cwd, branches) {
   try {
     const ref = await git(cwd, "symbolic-ref", "refs/remotes/origin/HEAD");
     const defaultBranch = ref.trim().replace("refs/remotes/origin/", "");
-    if (defaultBranch && branches.includes(defaultBranch)) {
+    // Repo default is metadata about origin, not a promise that the local selector should show it.
+    if (defaultBranch) {
       return defaultBranch;
     }
   } catch {
     // ignore
   }
+
+  // Some repos never record origin/HEAD locally, so prefer the common remote defaults before local fallback.
+  if (await remoteBranchExists(cwd, "main")) return "main";
+  if (await remoteBranchExists(cwd, "master")) return "master";
 
   // Fallback: prefer main, then master
   if (branches.includes("main")) return "main";
@@ -705,12 +1224,44 @@ async function resolveRepoRoot(cwd) {
   return repoRoot || null;
 }
 
+async function resolveLocalCheckoutRoot(cwd) {
+  const output = await git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir");
+  const commonDir = output.trim();
+  if (!commonDir) {
+    return null;
+  }
+
+  const normalizedCommonDir = normalizeExistingPath(commonDir);
+  if (!normalizedCommonDir) {
+    return null;
+  }
+
+  if (path.basename(normalizedCommonDir) !== ".git") {
+    return await resolveRepoRoot(cwd);
+  }
+
+  const checkoutRoot = normalizeExistingPath(path.dirname(normalizedCommonDir));
+  return checkoutRoot || null;
+}
+
 module.exports = {
   handleGitRequest,
   gitStatus,
   __test: {
     gitBranches,
+    gitCreateBranch,
+    gitCreateWorktree,
     gitCheckout,
+    gitRemoveWorktree,
+    isManagedWorktreePath,
     normalizeBranchListEntry,
+    normalizeCreatedBranchName,
+    parseWorktreePathByBranch,
+    ensureTrailingNewline,
+    resolveWorktreeChangeTransfer,
+    resolveLocalCheckoutRoot,
+    scopedLocalCheckoutPath,
+    scopedWorktreePath,
+    resolveBaseBranchName,
   },
 };

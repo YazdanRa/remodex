@@ -33,11 +33,19 @@ const MAX_PAIRING_AGE_MS = 5 * 60 * 1000;
 const MAX_BRIDGE_OUTBOUND_MESSAGES = 500;
 const MAX_BRIDGE_OUTBOUND_BYTES = 10 * 1024 * 1024;
 
-function createBridgeSecureTransport({ sessionId, relayUrl, deviceState }) {
+function createBridgeSecureTransport({
+  sessionId,
+  relayUrl,
+  deviceState,
+  onTrustedPhoneUpdate = null,
+}) {
   let currentDeviceState = deviceState;
   let pendingHandshake = null;
   let activeSession = null;
   let liveSendWireMessage = null;
+  // Tracks the highest bridge seq the phone has definitely acked, so replay
+  // decisions never depend on best-effort local socket writes.
+  let lastRelayedBridgeOutboundSeq = 0;
   let currentPairingExpiresAt = Date.now() + MAX_PAIRING_AGE_MS;
   let nextKeyEpoch = 1;
   let nextBridgeOutboundSeq = 1;
@@ -107,21 +115,17 @@ function createBridgeSecureTransport({ sessionId, relayUrl, deviceState }) {
     outboundBufferBytes += bufferEntry.sizeBytes;
     trimOutboundBuffer();
 
-    if (activeSession?.isResumed) {
-      sendBufferedEntry(bufferEntry, sendWireMessage);
+    const liveSessionSender = activeSession?.sendWireMessage;
+    const effectiveSendWireMessage = typeof liveSessionSender === "function"
+      ? liveSessionSender
+      : sendWireMessage;
+    if (activeSession?.isResumed && typeof effectiveSendWireMessage === "function") {
+      sendBufferedEntry(bufferEntry, effectiveSendWireMessage);
     }
   }
 
   function isSecureChannelReady() {
     return Boolean(activeSession?.isResumed);
-  }
-
-  // Rejects QR bootstraps from a second iPhone unless it is the already-trusted device.
-  function hasConflictingTrustedPhone(phoneDeviceId, phoneIdentityPublicKey) {
-    const trustedPhones = currentDeviceState.trustedPhones || {};
-    return Object.entries(trustedPhones).some(([trustedDeviceId, trustedPublicKey]) => (
-      trustedDeviceId !== phoneDeviceId || trustedPublicKey !== phoneIdentityPublicKey
-    ));
   }
 
   function handleClientHello(message, sendControlMessage) {
@@ -166,14 +170,6 @@ function createBridgeSecureTransport({ sessionId, relayUrl, deviceState }) {
     }
 
     const trustedPhonePublicKey = getTrustedPhonePublicKey(currentDeviceState, phoneDeviceId);
-    if (handshakeMode === HANDSHAKE_MODE_QR_BOOTSTRAP && hasConflictingTrustedPhone(phoneDeviceId, phoneIdentityPublicKey)) {
-      sendControlMessage(createSecureError({
-        code: "phone_replacement_required",
-        message: "This Mac is already paired with another iPhone. Reset pairing on the Mac before pairing a new phone.",
-      }));
-      return;
-    }
-
     if (handshakeMode === HANDSHAKE_MODE_TRUSTED_RECONNECT) {
       if (!trustedPhonePublicKey) {
         sendControlMessage(createSecureError({
@@ -358,11 +354,18 @@ function createBridgeSecureTransport({ sessionId, relayUrl, deviceState }) {
       || getTrustedPhonePublicKey(currentDeviceState, pendingHandshake.phoneDeviceId)
     ) {
       // Lock the trusted phone identity so later reconnects can be verified cleanly.
+      const previousTrustedPhonePublicKey = getTrustedPhonePublicKey(
+        currentDeviceState,
+        pendingHandshake.phoneDeviceId
+      );
       currentDeviceState = rememberTrustedPhone(
         currentDeviceState,
         pendingHandshake.phoneDeviceId,
         pendingHandshake.phoneIdentityPublicKey
       );
+      if (previousTrustedPhonePublicKey !== pendingHandshake.phoneIdentityPublicKey) {
+        onTrustedPhoneUpdate?.(currentDeviceState);
+      }
     }
     if (pendingHandshake.handshakeMode === HANDSHAKE_MODE_QR_BOOTSTRAP) {
       resetOutboundReplayState();
@@ -389,16 +392,13 @@ function createBridgeSecureTransport({ sessionId, relayUrl, deviceState }) {
     }
 
     const lastAppliedBridgeOutboundSeq = Number(message.lastAppliedBridgeOutboundSeq) || 0;
-    const missingEntries = outboundBuffer.filter(
-      (entry) => entry.bridgeOutboundSeq > lastAppliedBridgeOutboundSeq
-    );
+    lastRelayedBridgeOutboundSeq = lastAppliedBridgeOutboundSeq;
+    const missingEntries = replayableOutboundEntries(lastAppliedBridgeOutboundSeq);
     activeSession.isResumed = true;
     for (const entry of missingEntries) {
-      sendBufferedEntry(entry, messageText => {
-        if (typeof activeSession.sendWireMessage === "function") {
-          activeSession.sendWireMessage(messageText);
-        }
-      });
+      if (!sendBufferedEntry(entry, activeSession.sendWireMessage)) {
+        break;
+      }
     }
   }
 
@@ -457,6 +457,7 @@ function createBridgeSecureTransport({ sessionId, relayUrl, deviceState }) {
     liveSendWireMessage = sendWireMessage;
     if (activeSession) {
       activeSession.sendWireMessage = sendWireMessage;
+      replayBufferedOutboundMessages();
     }
   }
 
@@ -477,12 +478,13 @@ function createBridgeSecureTransport({ sessionId, relayUrl, deviceState }) {
   function resetOutboundReplayState() {
     outboundBuffer.length = 0;
     outboundBufferBytes = 0;
+    lastRelayedBridgeOutboundSeq = 0;
     nextBridgeOutboundSeq = 1;
   }
 
   function sendBufferedEntry(entry, sendWireMessage) {
-    if (!activeSession?.isResumed) {
-      return;
+    if (!activeSession?.isResumed || typeof sendWireMessage !== "function") {
+      return false;
     }
 
     const envelope = encryptEnvelopePayload(
@@ -497,7 +499,27 @@ function createBridgeSecureTransport({ sessionId, relayUrl, deviceState }) {
       activeSession.keyEpoch
     );
     activeSession.nextOutboundCounter += 1;
-    sendWireMessage(JSON.stringify(envelope));
+    return sendWireMessage(JSON.stringify(envelope)) !== false;
+  }
+
+  function replayableOutboundEntries(lastAppliedBridgeOutboundSeq) {
+    return outboundBuffer.filter(
+      (entry) => entry.bridgeOutboundSeq > lastAppliedBridgeOutboundSeq
+    );
+  }
+
+  // Replays from the last phone ack instead of local socket writes, so a relay
+  // flap cannot make the bridge skip output the phone never actually received.
+  function replayBufferedOutboundMessages() {
+    if (!activeSession?.isResumed || typeof activeSession.sendWireMessage !== "function") {
+      return;
+    }
+
+    for (const entry of replayableOutboundEntries(lastRelayedBridgeOutboundSeq)) {
+      if (!sendBufferedEntry(entry, activeSession.sendWireMessage)) {
+        break;
+      }
+    }
   }
 
   return {

@@ -1,7 +1,7 @@
 // FILE: TurnPlanModeComponents.swift
-// Purpose: Renders inline plan cards and structured question cards for plan mode.
+// Purpose: Renders inline plan cards, composer plan affordances, and structured question cards.
 // Layer: View Component
-// Exports: PlanSystemCard, StructuredUserInputCard
+// Exports: PlanSystemCard, PlanExecutionAccessory, PlanExecutionSheet, StructuredUserInputCard
 // Depends on: SwiftUI, CodexService, CodexMessage, StructuredUserInputCardView
 
 import SwiftUI
@@ -48,6 +48,49 @@ struct PlanSystemCard: View {
                 PlanStepList(steps: steps)
             }
         }
+    }
+}
+
+struct PlanExecutionAccessory: View {
+    let message: CodexMessage
+    let onTap: () -> Void
+
+    // Maps the live message into a previewable snapshot so the visual card can stay isolated.
+    private var snapshot: PlanAccessorySnapshot {
+        PlanAccessorySnapshot(message: message)
+    }
+
+    var body: some View {
+        PlanAccessoryCard(snapshot: snapshot, onTap: onTap)
+    }
+}
+
+struct PlanExecutionSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let message: CodexMessage
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    PlanSystemCard(message: message)
+                }
+                .padding(16)
+            }
+            .background(Color(.systemBackground))
+            .navigationTitle("Active plan")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
     }
 }
 
@@ -163,4 +206,8 @@ private struct PlanStepRow: View {
             return .green
         }
     }
+}
+
+#Preview("Plan Sheet") {
+    PlanExecutionSheet(message: PlanAccessoryPreviewFixtures.activeMessage)
 }

@@ -74,14 +74,44 @@ test("loadOrCreateBridgeDeviceState migrates a valid Keychain mirror into the ca
   });
 });
 
-test("loadOrCreateBridgeDeviceState rejects a corrupted canonical file instead of silently rotating identity", () => {
+test("loadOrCreateBridgeDeviceState throws when only the legacy Keychain mirror is corrupted", () => {
+  withTempDeviceStateEnv(({ keychainMirrorFile, canonicalStateFile }) => {
+    fs.writeFileSync(keychainMirrorFile, "{ definitely-not-json", "utf8");
+
+    assert.throws(
+      () => loadOrCreateBridgeDeviceState(),
+      /saved Remodex pairing state in legacy Keychain bridge state is unreadable/i
+    );
+    assert.equal(fs.existsSync(canonicalStateFile), false);
+  });
+});
+
+test("loadOrCreateBridgeDeviceState recovers a corrupted canonical file from a valid Keychain mirror", () => {
+  withTempDeviceStateEnv(({ canonicalStateFile, keychainMirrorFile }) => {
+    const mirroredState = makeDeviceState({
+      trustedPhones: {
+        "phone-7": "phone-public-key-7",
+      },
+    });
+    fs.mkdirSync(path.dirname(canonicalStateFile), { recursive: true });
+    fs.writeFileSync(canonicalStateFile, "{ definitely-not-json", "utf8");
+    fs.writeFileSync(keychainMirrorFile, JSON.stringify(mirroredState, null, 2));
+
+    const loadedState = loadOrCreateBridgeDeviceState();
+
+    assert.deepEqual(loadedState, mirroredState);
+    assert.deepEqual(readCanonicalStateFromDisk(), mirroredState);
+  });
+});
+
+test("loadOrCreateBridgeDeviceState throws when the canonical file is corrupted and no fallback exists", () => {
   withTempDeviceStateEnv(({ canonicalStateFile }) => {
     fs.mkdirSync(path.dirname(canonicalStateFile), { recursive: true });
     fs.writeFileSync(canonicalStateFile, "{ definitely-not-json", "utf8");
 
     assert.throws(
       () => loadOrCreateBridgeDeviceState(),
-      /reset-pairing/
+      /saved Remodex pairing state in device-state\.json is unreadable/i
     );
   });
 });

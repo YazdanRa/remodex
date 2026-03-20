@@ -13,6 +13,7 @@ enum SidebarThreadGroupKind: Equatable {
 struct SidebarProjectChoice: Identifiable, Equatable {
     let id: String
     let label: String
+    let iconSystemName: String
     let projectPath: String
     let sortDate: Date
 }
@@ -24,6 +25,15 @@ struct SidebarThreadGroup: Identifiable {
     let sortDate: Date
     let projectPath: String?
     let threads: [CodexThread]
+
+    var iconSystemName: String {
+        switch kind {
+        case .project:
+            return CodexThread.projectIconSystemName(for: projectPath)
+        case .archived:
+            return "archivebox"
+        }
+    }
 
     func contains(_ thread: CodexThread) -> Bool {
         threads.contains(where: { $0.id == thread.id })
@@ -73,6 +83,7 @@ enum SidebarThreadGrouping {
             return SidebarProjectChoice(
                 id: group.id,
                 label: group.label,
+                iconSystemName: group.iconSystemName,
                 projectPath: projectPath,
                 sortDate: group.sortDate
             )
@@ -98,7 +109,7 @@ enum SidebarThreadGrouping {
         let sortDate = representativeThread?.updatedAt ?? representativeThread?.createdAt ?? .distantPast
         return SidebarThreadGroup(
             id: "project:\(projectKey)",
-            label: representativeThread?.projectDisplayName ?? "No Project",
+            label: representativeThread?.projectDisplayName ?? "Cloud",
             kind: .project,
             sortDate: sortDate,
             projectPath: representativeThread?.normalizedProjectPath,

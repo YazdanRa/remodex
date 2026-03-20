@@ -317,9 +317,13 @@ extension CodexService {
         }
 
         // Rebuild repo-busy state immediately so sibling threads pick up the canonical root mid-run.
+        // Use the no-refresh variant to avoid a double full-thread refresh:
+        // refreshBusyRepoRoots already refreshes affected threads, and the revert cache is invalidated.
         if didChange {
-            invalidateAssistantRevertStates()
-            refreshBusyRepoRootsAndDependentTimelineStates()
+            invalidateAssistantRevertStatesWithoutRefresh()
+            if !refreshBusyRepoRootsAndDependentTimelineStates() {
+                refreshAllThreadTimelineStates()
+            }
         }
     }
 
@@ -338,7 +342,7 @@ extension CodexService {
 extension CodexService {
     // Shares the thread-bound working directory with timeline/revert UI without exposing the full change-set helper surface.
     func gitWorkingDirectory(for threadId: String) -> String? {
-        let workingDirectory = threads.first(where: { $0.id == threadId })?.gitWorkingDirectory
+        let workingDirectory = thread(for: threadId)?.gitWorkingDirectory
         return canonicalRepoIdentifier(for: workingDirectory) ?? workingDirectory
     }
 

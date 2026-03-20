@@ -7,9 +7,13 @@
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
 
-function createCodexTransport({ endpoint = "", env = process.env } = {}) {
+function createCodexTransport({
+  endpoint = "",
+  env = process.env,
+  WebSocketImpl = WebSocket,
+} = {}) {
   if (endpoint) {
-    return createWebSocketTransport({ endpoint });
+    return createWebSocketTransport({ endpoint, WebSocketImpl });
   }
 
   return createSpawnTransport({ env });
@@ -167,9 +171,11 @@ function isIgnorableStdinShutdownError(error) {
   return error?.code === "EPIPE" || error?.code === "ERR_STREAM_DESTROYED";
 }
 
-function createWebSocketTransport({ endpoint }) {
-  const socket = new WebSocket(endpoint);
+function createWebSocketTransport({ endpoint, WebSocketImpl = WebSocket }) {
+  const socket = new WebSocketImpl(endpoint);
   const listeners = createListenerBag();
+  const openState = WebSocketImpl.OPEN ?? WebSocket.OPEN ?? 1;
+  const connectingState = WebSocketImpl.CONNECTING ?? WebSocket.CONNECTING ?? 0;
 
   socket.on("message", (chunk) => {
     const message = typeof chunk === "string" ? chunk : chunk.toString("utf8");
@@ -191,11 +197,9 @@ function createWebSocketTransport({ endpoint }) {
       return endpoint;
     },
     send(message) {
-      if (socket.readyState !== WebSocket.OPEN) {
-        return;
+      if (socket.readyState === openState) {
+        socket.send(message);
       }
-
-      socket.send(message);
     },
     onMessage(handler) {
       listeners.onMessage = handler;
@@ -207,7 +211,7 @@ function createWebSocketTransport({ endpoint }) {
       listeners.onError = handler;
     },
     shutdown() {
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      if (socket.readyState === openState || socket.readyState === connectingState) {
         socket.close();
       }
     },

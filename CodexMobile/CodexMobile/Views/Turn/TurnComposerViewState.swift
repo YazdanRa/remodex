@@ -7,6 +7,7 @@
 import SwiftUI
 
 struct TurnComposerAutocompleteState {
+    let availableSlashCommands: [TurnComposerSlashCommand]
     let fileAutocompleteItems: [CodexFuzzyFileMatch]
     let isFileAutocompleteVisible: Bool
     let isFileAutocompleteLoading: Bool
@@ -17,6 +18,7 @@ struct TurnComposerAutocompleteState {
     let skillAutocompleteQuery: String
     let slashCommandPanelState: TurnComposerSlashCommandPanelState
     let hasComposerContentConflictingWithReview: Bool
+    let isThreadRunning: Bool
     let showsGitBranchSelector: Bool
     let isLoadingGitBranchTargets: Bool
     let selectedGitBaseBranch: String
@@ -26,11 +28,13 @@ struct TurnComposerAutocompleteState {
 struct TurnComposerAccessoryState {
     let queuedDrafts: [QueuedTurnDraft]
     let canSteerQueuedDrafts: Bool
+    let canRestoreQueuedDrafts: Bool
     let steeringDraftID: String?
     let composerAttachments: [TurnComposerImageAttachment]
     let composerMentionedFiles: [TurnComposerMentionedFile]
     let composerMentionedSkills: [TurnComposerMentionedSkill]
     let composerReviewSelection: TurnComposerReviewSelection?
+    let isSubagentsSelectionArmed: Bool
 
     var showsComposerAttachments: Bool {
         !composerAttachments.isEmpty
@@ -48,7 +52,11 @@ struct TurnComposerAccessoryState {
         composerReviewSelection?.target
     }
 
+    var showsSubagentsSelection: Bool {
+        isSubagentsSelectionArmed
+    }
+
     var topInputPadding: CGFloat {
-        showsComposerAttachments || showsMentionedFiles || showsMentionedSkills || reviewTarget != nil ? 8 : 14
+        showsComposerAttachments || showsMentionedFiles || showsMentionedSkills || showsSubagentsSelection || reviewTarget != nil ? 8 : 14
     }
 }

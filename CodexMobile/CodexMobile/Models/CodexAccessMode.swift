@@ -13,13 +13,22 @@ enum CodexAccessMode: String, Codable, CaseIterable, Hashable, Sendable {
     var displayName: String {
         switch self {
         case .onRequest:
-            return "On-Request"
+            return "Ask"
         case .fullAccess:
-            return "Full access"
+            return "Full"
         }
     }
 
-    // Tries modern server enum first, then legacy camelCase fallback.
+    var menuTitle: String {
+        switch self {
+        case .onRequest:
+            return "On-Request"
+        case .fullAccess:
+            return "Full Access"
+        }
+    }
+
+    // Tries modern approval-policy enums first, then the bridge's kebab-case sandbox enum fallback.
     var approvalPolicyCandidates: [String] {
         switch self {
         case .onRequest:
@@ -32,9 +41,9 @@ enum CodexAccessMode: String, Codable, CaseIterable, Hashable, Sendable {
     var sandboxLegacyValue: String {
         switch self {
         case .onRequest:
-            return "workspaceWrite"
+            return "workspace-write"
         case .fullAccess:
-            return "dangerFullAccess"
+            return "danger-full-access"
         }
     }
 }

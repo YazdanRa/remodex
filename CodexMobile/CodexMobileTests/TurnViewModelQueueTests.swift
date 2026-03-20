@@ -12,7 +12,7 @@ final class TurnViewModelQueueTests: XCTestCase {
     private static var retainedServices: [CodexService] = []
     private static var retainedViewModels: [TurnViewModel] = []
 
-    func testSendTurnQueuesImmediatelyWhenThreadBusy() async {
+    func testSendTurnQueuesImmediatelyWhenThreadBusy() async throws {
         let service = makeService()
         service.isConnected = true
         service.runningThreadIDs.insert("thread-queue")
@@ -509,6 +509,73 @@ final class TurnViewModelQueueTests: XCTestCase {
         XCTAssertEqual(service.activeTurnID(for: "thread-queue"), "turn-new")
     }
 
+    func testRestoreQueuedDraftMovesSelectedRowIntoComposerAndRemovesItFromQueue() {
+        let service = makeService()
+        let attachment = CodexImageAttachment(
+            thumbnailBase64JPEG: "thumb",
+            payloadDataURL: "data:image/jpeg;base64,DDDD"
+        )
+        let first = makeDraft(text: "keep queued")
+        let second = QueuedTurnDraft(
+            id: "draft-restore",
+            text: "Please inspect @CodexMobile/Views/Turn/TurnView.swift",
+            attachments: [attachment],
+            skillMentions: [
+                CodexTurnSkillMention(
+                    id: "check-code",
+                    name: "check-code",
+                    path: "/Users/me/.codex/skills/check-code/SKILL.md"
+                )
+            ],
+            collaborationMode: .plan,
+            rawInput: "Please inspect @TurnView.swift",
+            rawFileMentions: [
+                TurnComposerMentionedFile(
+                    fileName: "TurnView.swift",
+                    path: "CodexMobile/Views/Turn/TurnView.swift"
+                )
+            ],
+            rawSkillMentions: [
+                TurnComposerMentionedSkill(
+                    name: "check-code",
+                    path: "/Users/me/.codex/skills/check-code/SKILL.md",
+                    description: "Review code"
+                )
+            ],
+            rawAttachments: [
+                TurnComposerImageAttachment(id: "att-restore", state: .ready(attachment))
+            ],
+            rawSubagentsSelectionArmed: true,
+            createdAt: Date()
+        )
+
+        let viewModel = makeViewModel()
+        service.queuedTurnDraftsByThread["thread-queue"] = [first, second]
+
+        viewModel.restoreQueuedDraftToComposer(id: second.id, codex: service, threadID: "thread-queue")
+
+        XCTAssertEqual(service.queuedTurnDraftsByThread["thread-queue"]?.map(\.id), [first.id])
+        XCTAssertEqual(viewModel.input, "Please inspect @TurnView.swift")
+        XCTAssertEqual(viewModel.composerMentionedFiles.map(\.path), ["CodexMobile/Views/Turn/TurnView.swift"])
+        XCTAssertEqual(viewModel.composerMentionedSkills.map(\.name), ["check-code"])
+        XCTAssertEqual(viewModel.composerAttachments.count, 1)
+        XCTAssertTrue(viewModel.isSubagentsSelectionArmed)
+        XCTAssertTrue(viewModel.isPlanModeArmed)
+    }
+
+    func testRestoreQueuedDraftDoesNothingWhenComposerAlreadyHasContent() {
+        let service = makeService()
+        let viewModel = makeViewModel()
+        let draft = makeDraft(text: "queued")
+        service.queuedTurnDraftsByThread["thread-queue"] = [draft]
+        viewModel.input = "Already editing"
+
+        viewModel.restoreQueuedDraftToComposer(id: draft.id, codex: service, threadID: "thread-queue")
+
+        XCTAssertEqual(service.queuedTurnDraftsByThread["thread-queue"]?.map(\.id), [draft.id])
+        XCTAssertEqual(viewModel.input, "Already editing")
+    }
+
     func testRefreshInFlightTurnStateUsesLatestTurnAndClearsOlderInterruptibleTurn() async {
         let service = makeService()
         service.isConnected = true
@@ -581,6 +648,50 @@ final class TurnViewModelQueueTests: XCTestCase {
         XCTAssertTrue(service.runningThreadIDs.contains("thread-queue"))
         XCTAssertEqual(service.activeTurnIdByThread["thread-queue"], "turn-latest")
         XCTAssertEqual(service.activeTurnId, "turn-latest")
+    }
+
+    func testInterruptTurnDoesNotTargetCompletedLatestTurnWhenRunningTurnHasNoID() async {
+        let service = makeService()
+        service.isConnected = true
+        service.isInitialized = true
+        service.runningThreadIDs.insert("thread-queue")
+        service.protectedRunningFallbackThreadIDs.insert("thread-queue")
+
+        var recordedMethods: [String] = []
+        service.requestTransportOverride = { method, _ in
+            recordedMethods.append(method)
+            XCTAssertEqual(method, "thread/read")
+            return RPCMessage(
+                id: .string(UUID().uuidString),
+                result: .object([
+                    "thread": .object([
+                        "turns": .array([
+                            .object([
+                                "status": .string("in_progress"),
+                            ]),
+                            .object([
+                                "id": .string("turn-completed"),
+                                "status": .string("completed"),
+                            ]),
+                        ])
+                    ])
+                ]),
+                includeJSONRPC: false
+            )
+        }
+
+        do {
+            try await service.interruptTurn(turnId: nil, threadId: "thread-queue")
+            XCTFail("interruptTurn should fail when no interruptible turn id is available")
+        } catch {
+            XCTAssertTrue(
+                service.userFacingTurnErrorMessage(from: error).contains("interruptible turn ID")
+            )
+        }
+
+        XCTAssertEqual(recordedMethods, ["thread/read"])
+        XCTAssertFalse(service.runningThreadIDs.contains("thread-queue"))
+        XCTAssertTrue(service.protectedRunningFallbackThreadIDs.contains("thread-queue"))
     }
 
     func testSteerQueuedDraftIsNoOpWhenThreadIsNotRunning() async {

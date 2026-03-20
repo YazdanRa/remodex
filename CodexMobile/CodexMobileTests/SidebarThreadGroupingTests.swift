@@ -61,6 +61,29 @@ final class SidebarThreadGroupingTests: XCTestCase {
         XCTAssertEqual(groups[1].threads.map(\.id), ["archived-thread"])
     }
 
+    func testMakeGroupsMarksCodexManagedWorktreesInLabelAndIcon() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "main-thread", updatedAt: now, cwd: "/Users/me/work/Remodex"),
+            makeThread(
+                id: "worktree-thread",
+                updatedAt: now.addingTimeInterval(-60),
+                cwd: "/Users/me/.codex/worktrees/ce15/Remodex"
+            ),
+        ]
+
+        let groups = SidebarThreadGrouping.makeGroups(from: threads, now: now)
+        let mainGroup = try XCTUnwrap(groups.first(where: { $0.projectPath == "/Users/me/work/Remodex" }))
+        let worktreeGroup = try XCTUnwrap(
+            groups.first(where: { $0.projectPath == "/Users/me/.codex/worktrees/ce15/Remodex" })
+        )
+
+        XCTAssertEqual(mainGroup.label, "Remodex")
+        XCTAssertEqual(mainGroup.iconSystemName, "folder")
+        XCTAssertEqual(worktreeGroup.label, "Remodex 15")
+        XCTAssertEqual(worktreeGroup.iconSystemName, "arrow.triangle.branch")
+    }
+
     func testMakeProjectChoicesReusesLiveProjectBucketsAndSkipsNoProject() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let threads = [
@@ -78,7 +101,28 @@ final class SidebarThreadGroupingTests: XCTestCase {
         let choices = SidebarThreadGrouping.makeProjectChoices(from: threads)
 
         XCTAssertEqual(choices.map(\.label), ["app", "site"])
+        XCTAssertEqual(choices.map(\.iconSystemName), ["folder", "folder"])
         XCTAssertEqual(choices.map(\.projectPath), ["/Users/me/work/app", "/Users/me/work/site"])
+    }
+
+    func testMakeProjectChoicesKeepWorktreeSelectionCompactWithoutShowingPathInLabel() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = [
+            makeThread(id: "main-thread", updatedAt: now, cwd: "/Users/me/work/Remodex"),
+            makeThread(
+                id: "worktree-thread",
+                updatedAt: now.addingTimeInterval(-60),
+                cwd: "/Users/me/.codex/worktrees/ce15/Remodex"
+            ),
+        ]
+
+        let choices = SidebarThreadGrouping.makeProjectChoices(from: threads)
+        let labelsByPath = Dictionary(uniqueKeysWithValues: choices.map { ($0.projectPath, $0) })
+
+        XCTAssertEqual(labelsByPath["/Users/me/work/Remodex"]?.label, "Remodex")
+        XCTAssertEqual(labelsByPath["/Users/me/work/Remodex"]?.iconSystemName, "folder")
+        XCTAssertEqual(labelsByPath["/Users/me/.codex/worktrees/ce15/Remodex"]?.label, "Remodex 15")
+        XCTAssertEqual(labelsByPath["/Users/me/.codex/worktrees/ce15/Remodex"]?.iconSystemName, "arrow.triangle.branch")
     }
 
     func testLiveThreadIDsForProjectGroupUsesAllThreadsNotJustFilteredMatches() {
@@ -286,17 +330,121 @@ final class SidebarThreadGroupingTests: XCTestCase {
         XCTAssertFalse(shouldReveal)
     }
 
+    func testProjectThreadPreviewStateShowsOnlyLatestTenRootThreadsByDefault() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = (0..<12).map { index in
+            makeThread(
+                id: "thread-\(index)",
+                updatedAt: now.addingTimeInterval(TimeInterval(index * -60)),
+                cwd: "/Users/me/work/app"
+            )
+        }
+        let group = SidebarThreadGrouping.makeGroups(from: threads).first { $0.id == "project:/Users/me/work/app" }
+        let projectGroup = try XCTUnwrap(group)
+
+        let visibleRootThreads = SidebarProjectThreadPreviewState.visibleRootThreads(
+            for: projectGroup,
+            selectedThread: nil,
+            isFiltering: false,
+            manuallyExpandedGroupIDs: []
+        )
+
+        XCTAssertEqual(visibleRootThreads.count, 10)
+        XCTAssertEqual(visibleRootThreads.map(\.id), (0..<10).map { "thread-\($0)" })
+        XCTAssertTrue(
+            SidebarProjectThreadPreviewState.shouldShowMoreButton(
+                for: projectGroup,
+                selectedThread: nil,
+                isFiltering: false,
+                manuallyExpandedGroupIDs: []
+            )
+        )
+    }
+
+    func testProjectThreadPreviewStateAutoRevealsSelectedOlderRootThread() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let threads = (0..<12).map { index in
+            makeThread(
+                id: "thread-\(index)",
+                updatedAt: now.addingTimeInterval(TimeInterval(index * -60)),
+                cwd: "/Users/me/work/app"
+            )
+        }
+        let group = try XCTUnwrap(
+            SidebarThreadGrouping.makeGroups(from: threads).first { $0.id == "project:/Users/me/work/app" }
+        )
+
+        let visibleRootThreads = SidebarProjectThreadPreviewState.visibleRootThreads(
+            for: group,
+            selectedThread: threads[11],
+            isFiltering: false,
+            manuallyExpandedGroupIDs: []
+        )
+
+        XCTAssertEqual(visibleRootThreads.map(\.id), threads.map(\.id))
+        XCTAssertFalse(
+            SidebarProjectThreadPreviewState.shouldShowMoreButton(
+                for: group,
+                selectedThread: threads[11],
+                isFiltering: false,
+                manuallyExpandedGroupIDs: []
+            )
+        )
+    }
+
+    func testProjectThreadPreviewStateAutoRevealsSelectedSubagentWhenParentFallsPastCutoff() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        var threads = (0..<11).map { index in
+            makeThread(
+                id: "thread-\(index)",
+                updatedAt: now.addingTimeInterval(TimeInterval(index * -60)),
+                cwd: "/Users/me/work/app"
+            )
+        }
+        let selectedSubagent = makeThread(
+            id: "thread-10-subagent",
+            updatedAt: now.addingTimeInterval(-30),
+            cwd: "/Users/me/work/app",
+            parentThreadId: "thread-10"
+        )
+        threads.append(selectedSubagent)
+        let group = try XCTUnwrap(
+            SidebarThreadGrouping.makeGroups(from: threads).first { $0.id == "project:/Users/me/work/app" }
+        )
+
+        let visibleRootThreads = SidebarProjectThreadPreviewState.visibleRootThreads(
+            for: group,
+            selectedThread: selectedSubagent,
+            isFiltering: false,
+            manuallyExpandedGroupIDs: []
+        )
+
+        XCTAssertEqual(visibleRootThreads.map(\.id), (0..<11).map { "thread-\($0)" })
+        XCTAssertFalse(
+            SidebarProjectThreadPreviewState.shouldShowMoreButton(
+                for: group,
+                selectedThread: selectedSubagent,
+                isFiltering: false,
+                manuallyExpandedGroupIDs: []
+            )
+        )
+    }
+
     private func makeThread(
         id: String,
         updatedAt: Date,
         cwd: String?,
-        syncState: CodexThreadSyncState = .live
+        syncState: CodexThreadSyncState = .live,
+        parentThreadId: String? = nil,
+        forkedFromThreadId: String? = nil
     ) -> CodexThread {
         CodexThread(
             id: id,
             title: id,
             updatedAt: updatedAt,
             cwd: cwd,
+            forkedFromThreadId: forkedFromThreadId,
+            parentThreadId: parentThreadId,
             syncState: syncState
         )
     }

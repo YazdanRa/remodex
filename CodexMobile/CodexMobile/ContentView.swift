@@ -5,6 +5,7 @@
 // Depends on: SidebarView, TurnView, SettingsView, CodexService, ContentViewModel
 
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @Environment(CodexService.self) private var codex
@@ -19,6 +20,8 @@ struct ContentView: View {
     @State private var navigationPath = NavigationPath()
     @State private var showSettings = false
     @State private var isShowingManualScanner = false
+    @State private var hasDismissedAutomaticScanner = false
+    @State private var scannerCanReturnToOnboarding = false
     @State private var isSearchActive = false
     @State private var isRetryingBridgeUpdate = false
     @State private var isPreparingManualScanner = false
@@ -30,8 +33,11 @@ struct ContentView: View {
 
     var body: some View {
         rootContent
-            // Keep launch/foreground reconnect observers alive even while the QR scanner is visible.
+            // Only resume saved-pairing recovery after onboarding is done and the manual scanner is not in control.
             .task {
+                guard hasSeenOnboarding, !isShowingManualScanner else {
+                    return
+                }
                 await viewModel.attemptAutoConnectOnLaunchIfNeeded(codex: codex)
             }
             .onChange(of: showSettings) { _, show in
@@ -78,13 +84,16 @@ struct ContentView: View {
             .onChange(of: scenePhase) { _, phase in
                 codex.setForegroundState(phase != .background)
                 if phase == .active {
+                    guard hasSeenOnboarding, !isShowingManualScanner else {
+                        return
+                    }
                     Task {
                         await viewModel.attemptAutoReconnectOnForegroundIfNeeded(codex: codex)
                     }
                 }
             }
             .onChange(of: codex.shouldAutoReconnectOnForeground) { _, shouldReconnect in
-                guard shouldReconnect, scenePhase == .active else {
+                guard shouldReconnect, scenePhase == .active, hasSeenOnboarding, !isShowingManualScanner else {
                     return
                 }
                 Task {
@@ -155,30 +164,50 @@ struct ContentView: View {
     private var rootContent: some View {
         if !hasSeenOnboarding {
             OnboardingView {
-                withAnimation { hasSeenOnboarding = true }
+                finishOnboardingAndShowScanner()
             }
-        } else if isShowingManualScanner && !codex.isConnected {
+        } else if shouldShowQRScanner {
             qrScannerBody
-        } else if codex.isConnected
-            || viewModel.isAttemptingAutoReconnect
-            || shouldShowReconnectShell
-            || isPreparingManualScanner {
-            adaptiveMainAppBody
         } else {
-            qrScannerBody
+            adaptiveMainAppBody
         }
     }
 
-    private var qrScannerBody: some View {
-        QRScannerView { pairingPayload in
-            Task {
-                isShowingManualScanner = false
-                await viewModel.connectToRelay(
-                    pairingPayload: pairingPayload,
-                    codex: codex
-                )
-            }
+    private func finishOnboardingAndShowScanner() {
+        codex.shouldAutoReconnectOnForeground = false
+        codex.connectionRecoveryState = .idle
+        codex.lastErrorMessage = nil
+        withAnimation {
+            hasSeenOnboarding = true
+            isShowingManualScanner = true
+            hasDismissedAutomaticScanner = false
+            scannerCanReturnToOnboarding = true
         }
+    }
+
+    // Lets the scanner step back into onboarding on first run, or into the empty state later on.
+    private var scannerBackAction: (() -> Void)? {
+        if scannerCanReturnToOnboarding {
+            return { returnFromScannerToOnboarding() }
+        }
+        return { dismissScannerToHome() }
+    }
+
+    private var qrScannerBody: some View {
+        QRScannerView(
+            onBack: scannerBackAction,
+            onScan: { pairingPayload in
+                Task {
+                    isShowingManualScanner = false
+                    hasDismissedAutomaticScanner = false
+                    scannerCanReturnToOnboarding = false
+                    await viewModel.connectToRelay(
+                        pairingPayload: pairingPayload,
+                        codex: codex
+                    )
+                }
+            }
+        )
     }
 
     private var effectiveSidebarWidth: CGFloat {
@@ -265,14 +294,22 @@ struct ContentView: View {
         } else {
             HomeEmptyStateView(
                 connectionPhase: homeConnectionPhase,
+                statusMessage: codex.lastErrorMessage,
                 securityLabel: codex.secureConnectionState.statusLabel,
-                onToggleConnection: {
+                trustedPairPresentation: codex.trustedPairPresentation,
+                offlinePrimaryButtonTitle: codex.hasReconnectCandidate ? "Reconnect" : "Scan QR Code",
+                onPrimaryAction: {
+                    if homeConnectionPhase == .offline && !codex.hasReconnectCandidate {
+                        presentAutomaticScanner()
+                        return
+                    }
+
                     Task {
                         await viewModel.toggleConnection(codex: codex)
                     }
                 }
             ) {
-                if homeConnectionPhase == .connecting || (codex.hasSavedRelaySession && !codex.isConnected) {
+                if homeConnectionPhase == .connecting || (codex.hasReconnectCandidate && !codex.isConnected) {
                     Button("Scan New QR Code") {
                         presentManualScannerAfterStoppingReconnect()
                     }
@@ -280,6 +317,15 @@ struct ContentView: View {
                     .foregroundStyle(.primary)
                     .buttonStyle(.plain)
                     .disabled(isPreparingManualScanner)
+
+                    if codex.hasReconnectCandidate {
+                        Button("Forget Pair") {
+                            codex.forgetReconnectCandidate()
+                        }
+                        .font(AppFont.subheadline(weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .buttonStyle(.plain)
+                    }
                 }
             }
             .toolbar { mainContentToolbar }
@@ -369,23 +415,35 @@ struct ContentView: View {
 
     private func toggleSidebar() {
         HapticFeedback.shared.triggerImpactFeedback(style: .light)
-        withAnimation(Self.sidebarSpring) {
-            isSidebarOpen.toggle()
-            sidebarDragOffset = 0
-        }
+        let shouldOpenSidebar = !isSidebarOpen
+        setSidebar(open: shouldOpenSidebar)
     }
 
     private func closeSidebar() {
         HapticFeedback.shared.triggerImpactFeedback(style: .light)
-        withAnimation(Self.sidebarSpring) {
-            isSidebarOpen = false
-            sidebarDragOffset = 0
+        setSidebar(open: false)
+    }
+
+    // Keeps first-run installs in the scanner by default, while still letting users back out later.
+    private var shouldShowQRScanner: Bool {
+        guard !codex.isConnected else {
+            return false
         }
+
+        if isShowingManualScanner {
+            return true
+        }
+
+        if viewModel.isAttemptingAutoReconnect || shouldShowReconnectShell || isPreparingManualScanner {
+            return false
+        }
+
+        return !codex.hasReconnectCandidate && !hasDismissedAutomaticScanner
     }
 
     // Shows the remembered pairing shell while a saved pairing can still be retried.
     private var shouldShowReconnectShell: Bool {
-        codex.hasSavedRelaySession
+        codex.hasReconnectCandidate
             && !isShowingManualScanner
             && (codex.isConnecting
                 || viewModel.isAttemptingAutoReconnect
@@ -411,7 +469,7 @@ struct ContentView: View {
 
     // Keeps the reconnect CTA visible after retries stop, unless the pairing must be replaced.
     private var hasIdleSavedPairingRecovery: Bool {
-        guard codex.hasSavedRelaySession,
+        guard codex.hasReconnectCandidate,
               !codex.isConnected,
               codex.secureConnectionState != .rePairRequired else {
             return false
@@ -425,10 +483,23 @@ struct ContentView: View {
 
     private func finishGesture(open: Bool) {
         HapticFeedback.shared.triggerImpactFeedback(style: .light)
+        setSidebar(open: open)
+    }
+
+    // Forces UIKit-backed inputs like the composer text view to resign before the drawer settles open.
+    private func setSidebar(open: Bool) {
+        if open {
+            dismissActiveKeyboard()
+        }
         withAnimation(Self.sidebarSpring) {
             isSidebarOpen = open
             sidebarDragOffset = 0
         }
+    }
+
+    // Uses the responder chain instead of per-view bindings so mixed SwiftUI/UIKit inputs all close together.
+    private func dismissActiveKeyboard() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 
     private var bridgeUpdatePromptBinding: Binding<CodexBridgeUpdatePrompt?> {
@@ -476,22 +547,48 @@ struct ContentView: View {
         presentManualScannerAfterStoppingReconnect()
     }
 
-    // Waits for reconnect teardown before showing the scanner so stale retries cannot race the new QR flow.
+    // Shows the QR scanner immediately and tears down any stale reconnect in the background.
     private func presentManualScannerAfterStoppingReconnect() {
-        guard !isPreparingManualScanner, !isShowingManualScanner else {
+        guard !isShowingManualScanner else {
             return
         }
 
-        isPreparingManualScanner = true
+        hasDismissedAutomaticScanner = false
+        scannerCanReturnToOnboarding = false
+        isShowingManualScanner = true
 
         Task {
             await viewModel.stopAutoReconnectForManualScan(codex: codex)
-            await MainActor.run {
-                isPreparingManualScanner = false
-                if !codex.isConnected {
-                    isShowingManualScanner = true
-                }
-            }
+        }
+    }
+
+    // Re-opens the scanner after the user backed out to the empty state without a saved pairing.
+    private func presentAutomaticScanner() {
+        withAnimation {
+            hasDismissedAutomaticScanner = false
+        }
+    }
+
+    // Hides the scanner without forcing the user straight back into the camera on the next render pass.
+    private func dismissScannerToHome() {
+        withAnimation {
+            isShowingManualScanner = false
+            hasDismissedAutomaticScanner = true
+            scannerCanReturnToOnboarding = false
+        }
+    }
+
+    // Lets first-run pairing step back into onboarding without changing later recovery flows.
+    private func returnFromScannerToOnboarding() {
+        codex.shouldAutoReconnectOnForeground = false
+        codex.connectionRecoveryState = .idle
+        codex.lastErrorMessage = nil
+
+        withAnimation {
+            isShowingManualScanner = false
+            hasDismissedAutomaticScanner = false
+            scannerCanReturnToOnboarding = false
+            hasSeenOnboarding = false
         }
     }
 

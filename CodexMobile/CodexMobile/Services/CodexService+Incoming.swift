@@ -14,6 +14,46 @@ private struct CommandExecutionMessageContext {
     let itemId: String?
 }
 
+// Off-actor wire message classification and JSON-RPC decoding so transport callbacks
+// can parse before dispatching typed results to MainActor.
+enum WireMessagePreDecoder {
+    enum Result: Sendable {
+        case message(RPCMessage)
+        case decodeFailed
+        case invalidUTF8
+    }
+
+    struct Classification: Sendable {
+        let isSecure: Bool
+        let rpcResult: Result?
+    }
+
+    private static let secureKindValues = [
+        "\"serverHello\"", "\"secureReady\"", "\"secureError\"", "\"encryptedEnvelope\""
+    ]
+
+    static func decodeRPCMessage(from text: String) -> Result {
+        guard let data = text.data(using: .utf8) else { return .invalidUTF8 }
+        do {
+            let message = try JSONDecoder().decode(RPCMessage.self, from: data)
+            return .message(message)
+        } catch {
+            return .decodeFailed
+        }
+    }
+
+    static func classify(_ text: String) -> Classification {
+        if text.contains("\"kind\":") {
+            for value in secureKindValues {
+                if text.contains(value) {
+                    return Classification(isSecure: true, rpcResult: nil)
+                }
+            }
+        }
+        return Classification(isSecure: false, rpcResult: decodeRPCMessage(from: text))
+    }
+}
+
 extension CodexService {
     func processIncomingText(_ text: String) {
         guard let payloadData = text.data(using: .utf8) else {
@@ -25,6 +65,19 @@ extension CodexService {
             handleIncomingRPCMessage(message)
         } catch {
             lastErrorMessage = "Unable to decode server payload"
+        }
+    }
+
+    // Handles a pre-decoded RPC message from off-actor transport paths.
+    func handleDecodedRPCResult(_ result: WireMessagePreDecoder.Result, rawText: String) {
+        switch result {
+        case .message(let message):
+            lastRawMessage = rawText
+            handleIncomingRPCMessage(message)
+        case .decodeFailed:
+            lastErrorMessage = "Unable to decode server payload"
+        case .invalidUTF8:
+            break
         }
     }
 
@@ -366,9 +419,13 @@ extension CodexService {
         let threadName = firstStringValue(in: paramsObject, keys: renameKeys)
             ?? firstStringValue(in: eventObject, keys: renameKeys)
         let normalizedThreadName = normalizedIdentifier(threadName)
+        let hasLocalRename = persistedThreadRename(for: threadId) != nil
 
         if let normalizedThreadName, !normalizedThreadName.isEmpty {
-            if let existingIndex = threads.firstIndex(where: { $0.id == threadId }) {
+            guard !hasLocalRename else {
+                return
+            }
+            if let existingIndex = threadIndex(for: threadId) {
                 threads[existingIndex].title = normalizedThreadName
                 threads[existingIndex].name = normalizedThreadName
             } else {
@@ -387,7 +444,8 @@ extension CodexService {
 
         // If server explicitly sends an empty/null name, clear local custom title.
         guard hasExplicitRenameField,
-              let existingIndex = threads.firstIndex(where: { $0.id == threadId }) else {
+              !hasLocalRename,
+              let existingIndex = threadIndex(for: threadId) else {
             return
         }
 
@@ -851,7 +909,11 @@ extension CodexService {
             }
         }
 
-        let statusText = decodeCommandExecutionStatusText(payloadObject, isCompleted: false)
+        let statusText = decodeCommandExecutionStatusText(
+            payloadObject,
+            threadId: context.threadId,
+            isCompleted: false
+        )
         appendCommandExecutionOutputToDetails(itemId: context.itemId, paramsObject: paramsObject, eventObject: eventObject)
         publishCommandExecutionStatus(
             context: context,
@@ -1356,7 +1418,7 @@ extension CodexService {
             if let itemId, !itemId.isEmpty {
                 // Ensure details entry exists so output is captured.
                 if commandExecutionDetailsByItemID[itemId] == nil {
-                    upsertCommandExecutionDetails(from: state, isCompleted: false)
+                    upsertCommandExecutionDetails(from: state, threadId: threadId, isCompleted: false)
                 }
                 appendCommandExecutionOutputToDetails(itemId: itemId, paramsObject: normalizedParams, eventObject: payload)
 
@@ -1380,7 +1442,7 @@ extension CodexService {
         }
 
         let isCompleted = (eventType == "exec_command_end")
-        upsertCommandExecutionDetails(from: state, isCompleted: isCompleted)
+        upsertCommandExecutionDetails(from: state, threadId: threadId, isCompleted: isCompleted)
         let statusText = commandExecutionStatusText(for: state)
         if let itemId, !itemId.isEmpty {
             if isCompleted {
@@ -1699,6 +1761,13 @@ extension CodexService {
             || itemType == "filechange"
             || itemType == "toolcall"
             || itemType == "commandexecution"
+            || itemType == "collabagenttoolcall"
+            || itemType == "collabtoolcall"
+            || itemType.hasPrefix("collabagentspawn")
+            || itemType.hasPrefix("collabwaiting")
+            || itemType.hasPrefix("collabclose")
+            || itemType.hasPrefix("collabresume")
+            || itemType.hasPrefix("collabagentinteraction")
             || itemType == "diff"
             || itemType == "plan"
             || itemType == "enteredreviewmode"
@@ -1735,6 +1804,24 @@ extension CodexService {
         case "commandexecution":
             kind = .commandExecution
             body = decodeCommandExecutionStatusText(itemObject, isCompleted: isCompleted)
+        case let collabType where collabType == "collabagenttoolcall"
+            || collabType == "collabtoolcall"
+            || collabType.hasPrefix("collabagentspawn")
+            || collabType.hasPrefix("collabwaiting")
+            || collabType.hasPrefix("collabclose")
+            || collabType.hasPrefix("collabresume")
+            || collabType.hasPrefix("collabagentinteraction"):
+            guard let subagentAction = decodeSubagentActionItem(from: itemObject) else {
+                return false
+            }
+            upsertSubagentActionMessage(
+                threadId: threadId,
+                turnId: turnId,
+                itemId: itemId,
+                action: subagentAction,
+                isStreaming: !isCompleted
+            )
+            return true
         case "diff":
             guard let resolvedBody = decodeDiffItemBody(itemObject, isCompleted: isCompleted) else {
                 return false
@@ -2077,6 +2164,7 @@ extension CodexService {
 
     private func decodeCommandExecutionStatusText(
         _ itemObject: IncomingParamsObject,
+        threadId: String? = nil,
         isCompleted: Bool
     ) -> String {
         let state = decodeCommandRunViewState(
@@ -2084,7 +2172,7 @@ extension CodexService {
             paramsObject: nil,
             eventType: isCompleted ? "exec_command_end" : "exec_command_begin"
         )
-        upsertCommandExecutionDetails(from: state, isCompleted: isCompleted)
+        upsertCommandExecutionDetails(from: state, threadId: threadId, isCompleted: isCompleted)
         return commandExecutionStatusText(for: state)
     }
 
@@ -2092,8 +2180,15 @@ extension CodexService {
         "\(state.phase.rawValue) \(state.shortCommand)"
     }
 
-    private func upsertCommandExecutionDetails(from state: CommandRunViewState, isCompleted: Bool) {
+    private func upsertCommandExecutionDetails(
+        from state: CommandRunViewState,
+        threadId: String? = nil,
+        isCompleted: Bool
+    ) {
         guard let itemId = state.itemId, !itemId.isEmpty else { return }
+        if let threadId {
+            adoptManagedWorktreeProjectPathIfNeeded(threadId: threadId, projectPath: state.cwd)
+        }
         if var existing = commandExecutionDetailsByItemID[itemId] {
             if state.fullCommand.count > existing.fullCommand.count {
                 existing.fullCommand = state.fullCommand

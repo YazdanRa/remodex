@@ -23,16 +23,20 @@ struct SidebarView: View {
     @State private var projectGroupPendingArchive: SidebarThreadGroup? = nil
     @State private var threadPendingDeletion: CodexThread? = nil
     @State private var createThreadErrorMessage: String? = nil
+    @State private var cachedDiffTotals: [String: TurnSessionDiffTotals] = [:]
+    @State private var cachedRunBadges: [String: CodexThreadRunBadgeState] = [:]
+    @State private var lastDiffFingerprint: Int = 0
+    @State private var lastBadgeFingerprint: Int = 0
 
     var body: some View {
-        let diffTotalsByThreadID = sidebarDiffTotalsByThreadID
+        let diffTotalsByThreadID = cachedDiffTotals
 
         VStack(alignment: .leading, spacing: 0) {
             SidebarHeaderView()
 
             SidebarSearchField(text: $searchText, isActive: $isSearchActive)
                 .padding(.horizontal, 16)
-                .padding(.top, 6)
+                .padding(.top, 8)
                 .padding(.bottom, 6)
 
             SidebarNewChatButton(
@@ -54,7 +58,7 @@ struct SidebarView: View {
                 bottomContentInset: 0,
                 timingLabelProvider: { SidebarRelativeTimeFormatter.compactLabel(for: $0) },
                 diffTotalsByThreadID: diffTotalsByThreadID,
-                runBadgeStateByThreadID: runBadgeStateByThreadID,
+                runBadgeStateByThreadID: cachedRunBadges,
                 onSelectThread: selectThread,
                 onCreateThreadInProjectGroup: { group in
                     handleNewChatTap(preferredProjectPath: group.projectPath)
@@ -85,6 +89,14 @@ struct SidebarView: View {
 
             HStack(spacing: 10) {
                 SidebarFloatingSettingsButton(colorScheme: colorScheme, action: openSettings)
+                Spacer(minLength: 0)
+                if let trustedPairPresentation = codex.trustedPairPresentation {
+                    SidebarMacConnectionStatusView(
+                        name: trustedPairPresentation.name,
+                        systemName: trustedPairPresentation.systemName,
+                        isConnected: codex.isConnected
+                    )
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 10)
@@ -93,18 +105,29 @@ struct SidebarView: View {
         .background(Color(.systemBackground))
         .task {
             rebuildGroupedThreads()
+            rebuildCachedSidebarState()
             if codex.isConnected, codex.threads.isEmpty {
                 await refreshThreads()
             }
         }
         .onChange(of: codex.threads) { _, _ in
             rebuildGroupedThreads()
+            rebuildCachedSidebarState()
         }
         .onChange(of: searchText) { _, _ in
             rebuildGroupedThreads()
         }
+        .onChange(of: diffFingerprint) { _, _ in
+            rebuildCachedDiffTotals()
+        }
+        .onChange(of: badgeFingerprint) { _, _ in
+            rebuildCachedRunBadges()
+        }
         .overlay {
-            if codex.isLoadingThreads {
+            if SidebarThreadsLoadingPresentation.shouldShowOverlay(
+                isLoadingThreads: codex.isLoadingThreads,
+                threadCount: codex.threads.count
+            ) {
                 ProgressView()
                     .padding()
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
@@ -199,21 +222,12 @@ struct SidebarView: View {
 
     private func handleNewChatTap(preferredProjectPath: String?) {
         Task { @MainActor in
-            guard codex.isConnected else {
-                createThreadErrorMessage = "Connect to runtime first."
-                return
-            }
-            guard codex.isInitialized else {
-                createThreadErrorMessage = "Runtime is still initializing. Wait a moment and retry."
-                return
-            }
-
             createThreadErrorMessage = nil
             isCreatingThread = true
             defer { isCreatingThread = false }
 
             do {
-                let thread = try await codex.startThread(preferredProjectPath: preferredProjectPath)
+                let thread = try await codex.startThreadIfReady(preferredProjectPath: preferredProjectPath)
                 selectedThread = thread
                 onClose()
             } catch {
@@ -273,19 +287,39 @@ struct SidebarView: View {
         groupedThreads = SidebarThreadGrouping.makeGroups(from: source)
     }
 
-    private var runBadgeStateByThreadID: [String: CodexThreadRunBadgeState] {
-        var byThreadID: [String: CodexThreadRunBadgeState] = [:]
+    // Cheap fingerprint: hashes thread IDs + message revisions (O(n) integer work, no message access).
+    private var diffFingerprint: Int {
+        var hasher = Hasher()
         for thread in codex.threads {
-            if let state = codex.threadRunBadgeState(for: thread.id) {
-                byThreadID[thread.id] = state
-            }
+            hasher.combine(thread.id)
+            hasher.combine(codex.messageRevision(for: thread.id))
         }
-        return byThreadID
+        return hasher.finalize()
     }
 
-    private var sidebarDiffTotalsByThreadID: [String: TurnSessionDiffTotals] {
-        var byThreadID: [String: TurnSessionDiffTotals] = [:]
+    // Cheap fingerprint for run badge state — changes when running/ready/failed sets change.
+    private var badgeFingerprint: Int {
+        var hasher = Hasher()
+        for thread in codex.threads {
+            hasher.combine(thread.id)
+            if let badge = codex.threadRunBadgeState(for: thread.id) {
+                hasher.combine(badge)
+            }
+        }
+        return hasher.finalize()
+    }
 
+    private func rebuildCachedSidebarState() {
+        rebuildCachedDiffTotals()
+        rebuildCachedRunBadges()
+    }
+
+    private func rebuildCachedDiffTotals() {
+        let fp = diffFingerprint
+        guard fp != lastDiffFingerprint else { return }
+        lastDiffFingerprint = fp
+
+        var byThreadID: [String: TurnSessionDiffTotals] = [:]
         for thread in codex.threads {
             let messages = codex.messages(for: thread.id)
             if let totals = TurnSessionDiffSummaryCalculator.totals(
@@ -295,8 +329,21 @@ struct SidebarView: View {
                 byThreadID[thread.id] = totals
             }
         }
+        cachedDiffTotals = byThreadID
+    }
 
-        return byThreadID
+    private func rebuildCachedRunBadges() {
+        let fp = badgeFingerprint
+        guard fp != lastBadgeFingerprint else { return }
+        lastBadgeFingerprint = fp
+
+        var byThreadID: [String: CodexThreadRunBadgeState] = [:]
+        for thread in codex.threads {
+            if let state = codex.threadRunBadgeState(for: thread.id) {
+                byThreadID[thread.id] = state
+            }
+        }
+        cachedRunBadges = byThreadID
     }
 
     // Keeps the chooser in sync with the same project buckets shown in the sidebar.
@@ -306,6 +353,13 @@ struct SidebarView: View {
 
     private var canCreateThread: Bool {
         codex.isConnected && codex.isInitialized
+    }
+}
+
+enum SidebarThreadsLoadingPresentation {
+    // Keeps pull-to-refresh from stacking a second spinner over an already populated sidebar.
+    static func shouldShowOverlay(isLoadingThreads: Bool, threadCount: Int) -> Bool {
+        isLoadingThreads && threadCount == 0
     }
 }
 
@@ -326,30 +380,26 @@ private struct SidebarNewChatProjectPickerSheet: View {
                         .listRowBackground(Color.clear)
                 }
 
-                Section("Projects") {
+                Section("Local") {
                     ForEach(choices) { choice in
                         Button {
                             dismiss()
                             onSelectProject(choice.projectPath)
                         } label: {
-                            HStack(alignment: .top, spacing: 12) {
-                                Image(systemName: "folder")
-                                    .font(AppFont.body(weight: .medium))
-                                    .foregroundStyle(.secondary)
-
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(choice.label)
-                                        .font(AppFont.body(weight: .semibold))
-                                        .foregroundStyle(.primary)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                                    Text(choice.projectPath)
-                                        .font(AppFont.mono(.caption))
+                            HStack(spacing: 12) {
+                                if choice.iconSystemName == "arrow.triangle.branch" {
+                                    CodexWorktreeIcon(pointSize: 16, weight: .medium)
                                         .foregroundStyle(.secondary)
-                                        .lineLimit(2)
-                                        .truncationMode(.middle)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                } else {
+                                    Image(systemName: choice.iconSystemName)
+                                        .font(AppFont.body(weight: .medium))
+                                        .foregroundStyle(.secondary)
                                 }
+
+                                Text(choice.label)
+                                    .font(AppFont.body(weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                             }
                             .padding(.vertical, 2)
                         }
@@ -362,17 +412,17 @@ private struct SidebarNewChatProjectPickerSheet: View {
                         onSelectWithoutProject()
                     } label: {
                         HStack(alignment: .top, spacing: 12) {
-                            Image(systemName: "plus.bubble")
+                            Image(systemName: "cloud")
                                 .font(AppFont.body(weight: .medium))
                                 .foregroundStyle(.secondary)
 
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("No Project")
+                                Text("Cloud")
                                     .font(AppFont.body(weight: .semibold))
                                     .foregroundStyle(.primary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                                Text("Start a chat without a working directory.")
+                                Text("Start a chat without a local working directory.")
                                     .font(AppFont.body())
                                     .foregroundStyle(.secondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -384,7 +434,7 @@ private struct SidebarNewChatProjectPickerSheet: View {
 
                 Section {
                     // Explains the existing scoping rule at the exact moment the user chooses it.
-                    Text("Chats started in a project stay scoped to that working directory. If you pick No Project, the chat is global.")
+                    Text("Chats started in a project stay scoped to that working directory. If you pick Cloud, the chat is global.")
                         .font(AppFont.caption())
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

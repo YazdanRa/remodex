@@ -19,15 +19,22 @@ let hasLoggedKeychainMismatch = false;
 // Loads the canonical bridge state or bootstraps a fresh one when no trusted state exists yet.
 function loadOrCreateBridgeDeviceState() {
   const fileRecord = readCanonicalFileStateRecord();
-  if (fileRecord.error) {
-    throw corruptedStateError("device-state.json", fileRecord.error);
-  }
-
   const keychainRecord = readKeychainStateRecord();
 
   if (fileRecord.state) {
     reconcileLegacyKeychainMirror(fileRecord.state, keychainRecord);
     return fileRecord.state;
+  }
+
+  if (fileRecord.error) {
+    if (keychainRecord.state) {
+      warnOnce(
+        "[remodex] Recovering the canonical device-state.json from the legacy Keychain pairing mirror."
+      );
+      writeBridgeDeviceState(keychainRecord.state);
+      return keychainRecord.state;
+    }
+    throw corruptedStateError("device-state.json", fileRecord.error);
   }
 
   if (keychainRecord.error) {

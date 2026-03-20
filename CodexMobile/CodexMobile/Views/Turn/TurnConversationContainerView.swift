@@ -25,22 +25,27 @@ struct TurnConversationContainerView: View {
     let isRepositoryLoadingToastVisible: Bool
     let onRetryUserMessage: (String) -> Void
     let onTapAssistantRevert: (CodexMessage) -> Void
+    let onTapSubagent: (CodexSubagentThreadPresentation) -> Void
     let onTapOutsideComposer: () -> Void
 
-    // Pins only the checklist-style plan card that includes task rows and statuses.
-    private var pinnedTaskPlanMessage: CodexMessage? {
-        messages.last { $0.showsPinnedTaskChecklist }
+    @State private var isShowingPinnedPlanSheet = false
+    @State private var cachedMessageLayout = TimelineMessageLayout.empty
+    @State private var lastMessageLayoutThreadID: String?
+    @State private var lastMessageLayoutToken: Int = -1
+
+    // Falls back to a one-off rebuild during first render, then keeps later renders on cached derived state.
+    private var messageLayout: TimelineMessageLayout {
+        guard lastMessageLayoutThreadID == threadID,
+              lastMessageLayoutToken == timelineChangeToken else {
+            return Self.buildMessageLayout(from: messages)
+        }
+        return cachedMessageLayout
     }
 
-    // Keeps the checklist card from rendering twice once it moves into the top overlay.
-    private var timelineMessages: [CodexMessage] {
-        guard let pinnedTaskPlanMessage else { return messages }
-        return messages.filter { $0.id != pinnedTaskPlanMessage.id }
-    }
-
-    // Avoids showing the generic "new chat" empty state behind a pinned plan-only overlay.
+    // Avoids showing the generic "new chat" empty state behind a pinned plan-only accessory.
     private var timelineEmptyState: AnyView {
-        guard pinnedTaskPlanMessage != nil, timelineMessages.isEmpty else {
+        guard messageLayout.pinnedTaskPlanMessage != nil,
+              messageLayout.timelineMessages.isEmpty else {
             return emptyState
         }
         return AnyView(
@@ -52,52 +57,120 @@ struct TurnConversationContainerView: View {
     // ─── ENTRY POINT ─────────────────────────────────────────────
     var body: some View {
         ZStack(alignment: .top) {
-            VStack(spacing: 0) {
-                TurnTimelineView(
-                    threadID: threadID,
-                    messages: timelineMessages,
-                    timelineChangeToken: timelineChangeToken,
-                    activeTurnID: activeTurnID,
-                    isThreadRunning: isThreadRunning,
-                    latestTurnTerminalState: latestTurnTerminalState,
-                    stoppedTurnIDs: stoppedTurnIDs,
-                    assistantRevertStatesByMessageID: assistantRevertStatesByMessageID,
-                    isRetryAvailable: !isThreadRunning,
-                    errorMessage: errorMessage,
-                    shouldAnchorToAssistantResponse: shouldAnchorToAssistantResponse,
-                    isScrolledToBottom: isScrolledToBottom,
-                    onRetryUserMessage: onRetryUserMessage,
-                    onTapAssistantRevert: onTapAssistantRevert,
-                    onTapOutsideComposer: onTapOutsideComposer
-                ) {
-                    timelineEmptyState
-                } composer: {
-                    composer
-                }
+            TurnTimelineView(
+                threadID: threadID,
+                messages: messageLayout.timelineMessages,
+                timelineChangeToken: timelineChangeToken,
+                activeTurnID: activeTurnID,
+                isThreadRunning: isThreadRunning,
+                latestTurnTerminalState: latestTurnTerminalState,
+                stoppedTurnIDs: stoppedTurnIDs,
+                assistantRevertStatesByMessageID: assistantRevertStatesByMessageID,
+                isRetryAvailable: !isThreadRunning,
+                errorMessage: errorMessage,
+                shouldAnchorToAssistantResponse: shouldAnchorToAssistantResponse,
+                isScrolledToBottom: isScrolledToBottom,
+                onRetryUserMessage: onRetryUserMessage,
+                onTapAssistantRevert: onTapAssistantRevert,
+                onTapSubagent: onTapSubagent,
+                onTapOutsideComposer: onTapOutsideComposer
+            ) {
+                timelineEmptyState
+            } composer: {
+                composerWithPinnedPlanAccessory
             }
 
             VStack(spacing: 0) {
-                if let pinnedTaskPlanMessage {
-                    PlanSystemCard(message: pinnedTaskPlanMessage)
-                        .padding(.horizontal, 16)
-                        .padding(.top, 12)
-                        .shadow(color: Color.black.opacity(0.18), radius: 18, y: 8)
-                }
-
                 repositoryLoadingToastOverlay
                 if !isRepositoryLoadingToastVisible {
                     usageToastOverlay
                 }
             }
         }
+        .onAppear {
+            rebuildMessageLayoutIfNeeded(force: true)
+        }
+        .onChange(of: threadID) { _, _ in
+            rebuildMessageLayoutIfNeeded(force: true)
+        }
+        .onChange(of: timelineChangeToken) { _, _ in
+            rebuildMessageLayoutIfNeeded()
+        }
+        .onChange(of: messageLayout.pinnedTaskPlanMessage?.id) { _, newValue in
+            if newValue == nil {
+                isShowingPinnedPlanSheet = false
+            }
+        }
+        .sheet(isPresented: $isShowingPinnedPlanSheet) {
+            if let pinnedTaskPlanMessage = messageLayout.pinnedTaskPlanMessage {
+                PlanExecutionSheet(message: pinnedTaskPlanMessage)
+            }
+        }
+    }
+
+    // Keeps the active plan discoverable without covering the message timeline.
+    private var composerWithPinnedPlanAccessory: some View {
+        VStack(spacing: 8) {
+            if let pinnedTaskPlanMessage = messageLayout.pinnedTaskPlanMessage {
+                PlanExecutionAccessory(message: pinnedTaskPlanMessage) {
+                    isShowingPinnedPlanSheet = true
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            composer
+        }
+        .animation(.easeInOut(duration: 0.18), value: messageLayout.pinnedTaskPlanMessage?.id)
+    }
+
+    // Rebuilds the plan/timeline split only when the thread or timeline token really changed.
+    private func rebuildMessageLayoutIfNeeded(force: Bool = false) {
+        guard force
+                || lastMessageLayoutThreadID != threadID
+                || lastMessageLayoutToken != timelineChangeToken else {
+            return
+        }
+
+        lastMessageLayoutThreadID = threadID
+        lastMessageLayoutToken = timelineChangeToken
+        cachedMessageLayout = Self.buildMessageLayout(from: messages)
+    }
+
+    // Separates pinned plan content from renderable timeline rows in one pass.
+    private static func buildMessageLayout(from messages: [CodexMessage]) -> TimelineMessageLayout {
+        var timelineMessages: [CodexMessage] = []
+        timelineMessages.reserveCapacity(messages.count)
+        var pinnedTaskPlanMessage: CodexMessage?
+
+        for message in messages {
+            if message.isPlanSystemMessage {
+                pinnedTaskPlanMessage = message
+            } else {
+                timelineMessages.append(message)
+            }
+        }
+
+        return TimelineMessageLayout(
+            timelineMessages: timelineMessages,
+            pinnedTaskPlanMessage: pinnedTaskPlanMessage
+        )
     }
 }
 
+private struct TimelineMessageLayout: Equatable {
+    let timelineMessages: [CodexMessage]
+    let pinnedTaskPlanMessage: CodexMessage?
+
+    static let empty = TimelineMessageLayout(
+        timelineMessages: [],
+        pinnedTaskPlanMessage: nil
+    )
+}
+
 private extension CodexMessage {
-    var showsPinnedTaskChecklist: Bool {
-        guard role == .system, kind == .plan else {
-            return false
-        }
-        return !(planState?.steps.isEmpty ?? true)
+    var isPlanSystemMessage: Bool {
+        role == .system && kind == .plan
     }
 }

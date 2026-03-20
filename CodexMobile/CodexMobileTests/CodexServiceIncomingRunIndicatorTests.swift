@@ -330,6 +330,37 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertNil(service.threadRunBadgeState(for: threadID))
     }
 
+    func testPrepareThreadForDisplaySkipsHydrationForFreshEmptyThread() async {
+        let service = makeService()
+        let freshThreadID = "thread-fresh-\(UUID().uuidString)"
+        let runningThreadID = "thread-running-\(UUID().uuidString)"
+        let runningTurnID = "turn-running-\(UUID().uuidString)"
+
+        service.isConnected = true
+        service.isInitialized = true
+        service.threads = [
+            CodexThread(id: freshThreadID, createdAt: Date(), updatedAt: Date()),
+            CodexThread(id: runningThreadID, createdAt: Date(), updatedAt: Date())
+        ]
+        service.resumedThreadIDs.insert(freshThreadID)
+        service.runningThreadIDs.insert(runningThreadID)
+        service.activeTurnIdByThread[runningThreadID] = runningTurnID
+        service.activeThreadId = runningThreadID
+
+        var recordedMethods: [String] = []
+        service.requestTransportOverride = { method, _ in
+            recordedMethods.append(method)
+            XCTFail("Fresh empty thread should not trigger RPC during initial display prep")
+            return RPCMessage(id: .string(UUID().uuidString), result: .object([:]), includeJSONRPC: false)
+        }
+
+        let didPrepare = await service.prepareThreadForDisplay(threadId: freshThreadID)
+
+        XCTAssertTrue(didPrepare)
+        XCTAssertEqual(service.activeThreadId, freshThreadID)
+        XCTAssertTrue(recordedMethods.isEmpty)
+    }
+
     func testActiveThreadDoesNotReceiveReadyOrFailedBadge() {
         let service = makeService()
         let threadID = "thread-\(UUID().uuidString)"
@@ -489,7 +520,7 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         }
     }
 
-    func testMacUnavailableCloseClearsSavedPairingAndDisablesReconnect() {
+    func testMacUnavailableCloseKeepsSavedPairingAndRetriesReconnect() {
         let service = makeService()
 
         withSavedRelayPairing(sessionId: "session-\(UUID().uuidString)", relayURL: "wss://relay.test/relay") {
@@ -497,6 +528,8 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
             service.relayUrl = SecureStore.readString(for: CodexSecureKeys.relayUrl)
             service.isConnected = true
             service.isInitialized = true
+            service.lastErrorMessage = nil
+            service.setForegroundState(true)
 
             service.handleReceiveError(
                 CodexServiceError.disconnected,
@@ -504,12 +537,59 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
             )
 
             XCTAssertFalse(service.isConnected)
-            XCTAssertFalse(service.shouldAutoReconnectOnForeground)
-            XCTAssertNil(service.relaySessionId)
-            XCTAssertNil(service.relayUrl)
+            XCTAssertFalse(service.isInitialized)
+            XCTAssertTrue(service.shouldAutoReconnectOnForeground)
+            XCTAssertEqual(service.relaySessionId, SecureStore.readString(for: CodexSecureKeys.relaySessionId))
+            XCTAssertEqual(service.relayUrl, SecureStore.readString(for: CodexSecureKeys.relayUrl))
             XCTAssertEqual(
                 service.lastErrorMessage,
-                "This relay pairing is no longer valid. Scan a new QR code to reconnect."
+                "The saved Mac session is temporarily unavailable. Remodex will keep retrying. If you restarted the bridge on your Mac, scan the new QR code."
+            )
+            XCTAssertEqual(service.connectionRecoveryState, .retrying(attempt: 0, message: "Reconnecting..."))
+        }
+    }
+
+    func testReceiveErrorClearsResumedThreadCacheForReconnect() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+
+        service.resumedThreadIDs = [threadID]
+        service.isConnected = true
+        service.isInitialized = true
+
+        service.handleReceiveError(
+            CodexServiceError.disconnected,
+            relayCloseCode: .privateCode(4002)
+        )
+
+        XCTAssertTrue(service.resumedThreadIDs.isEmpty)
+    }
+
+    func testMacAbsenceBufferOverflowKeepsPairingAndShowsRetryMessage() {
+        let service = makeService()
+
+        withSavedRelayPairing(sessionId: "session-\(UUID().uuidString)", relayURL: "wss://relay.test/relay") {
+            service.relaySessionId = SecureStore.readString(for: CodexSecureKeys.relaySessionId)
+            service.relayUrl = SecureStore.readString(for: CodexSecureKeys.relayUrl)
+            service.isConnected = true
+            service.isInitialized = true
+            service.lastErrorMessage = nil
+            service.setForegroundState(true)
+
+            service.handleReceiveError(
+                CodexServiceError.disconnected,
+                relayCloseCode: .privateCode(4004)
+            )
+
+            XCTAssertFalse(service.isConnected)
+            XCTAssertFalse(service.isInitialized)
+            XCTAssertTrue(service.shouldAutoReconnectOnForeground)
+            XCTAssertEqual(service.connectionRecoveryState, .idle)
+            XCTAssertEqual(service.relaySessionId, SecureStore.readString(for: CodexSecureKeys.relaySessionId))
+            XCTAssertEqual(service.relayUrl, SecureStore.readString(for: CodexSecureKeys.relayUrl))
+            XCTAssertEqual(
+                service.lastErrorMessage,
+                "The Mac was temporarily unavailable and this message could not be delivered. Wait a moment, then try again."
             )
         }
     }
@@ -539,7 +619,7 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertTrue(service.shouldAutoReconnectOnForeground)
     }
 
-    func testRepeatedTrustedReconnectDisconnectsEscalateToManualRePair() {
+    func testRepeatedTrustedReconnectDisconnectsPreserveSavedReconnectCandidate() {
         let service = makeService()
         let macDeviceID = "mac-\(UUID().uuidString)"
         let macPublicKey = "public-key-\(UUID().uuidString)"
@@ -547,10 +627,12 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         service.relaySessionId = "session-\(UUID().uuidString)"
         service.relayUrl = "wss://relay.test/relay"
         service.relayMacDeviceId = macDeviceID
+        service.lastTrustedMacDeviceId = macDeviceID
         service.trustedMacRegistry.records[macDeviceID] = CodexTrustedMacRecord(
             macDeviceId: macDeviceID,
             macIdentityPublicKey: macPublicKey,
-            lastPairedAt: Date()
+            lastPairedAt: Date(),
+            relayURL: "wss://relay.test/relay"
         )
 
         for _ in 0..<3 {
@@ -561,11 +643,16 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         XCTAssertEqual(service.trustedReconnectFailureCount, 3)
         XCTAssertFalse(service.shouldAutoReconnectOnForeground)
         XCTAssertEqual(service.connectionRecoveryState, .idle)
-        XCTAssertEqual(service.secureConnectionState, .rePairRequired)
+        XCTAssertEqual(service.secureConnectionState, .liveSessionUnresolved)
+        XCTAssertNotNil(service.relaySessionId)
+        XCTAssertNotNil(service.relayUrl)
+        XCTAssertEqual(service.relayMacDeviceId, macDeviceID)
         XCTAssertEqual(
             service.lastErrorMessage,
-            "Secure reconnect could not be restored. Scan a new QR code to reconnect."
+            "Secure reconnect could not be restored from the saved session. Try reconnecting again."
         )
+        XCTAssertTrue(service.hasSavedRelaySession)
+        XCTAssertTrue(service.hasTrustedMacReconnectCandidate)
     }
 
     func testTrustedReconnectHandshakeFailureCounterResetsForFreshPairing() {
@@ -671,6 +758,46 @@ final class CodexServiceIncomingRunIndicatorTests: XCTestCase {
         service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: " chunk")
 
         XCTAssertEqual(service.currentOutput, "First chunk")
+    }
+
+    func testAssistantStreamingFallbackKeepsCurrentOutputInSyncWithoutTimelineState() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        service.activeThreadId = threadID
+
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: "First")
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: " chunk")
+
+        XCTAssertEqual(service.currentOutput, "First chunk")
+        XCTAssertEqual(service.timelineState(for: threadID).renderSnapshot.messages.first?.text, "First chunk")
+    }
+
+    func testLateDeltaForOlderAssistantItemDoesNotReplaceLatestOutput() {
+        let service = makeService()
+        let threadID = "thread-\(UUID().uuidString)"
+        let turnID = "turn-\(UUID().uuidString)"
+
+        _ = service.timelineState(for: threadID)
+        service.activeThreadId = threadID
+
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: "First")
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-2", delta: "Second")
+        service.appendAssistantDelta(threadId: threadID, turnId: turnID, itemId: "item-1", delta: " tail")
+
+        XCTAssertEqual(service.currentOutput, "Second")
+    }
+
+    func testMergeAssistantDeltaKeepsLongReplayOverlapWithoutDuplication() {
+        let service = makeService()
+        let overlap = String(repeating: "a", count: 300)
+        let existing = "prefix-" + overlap
+        let incoming = overlap + "-suffix"
+
+        let merged = service.mergeAssistantDelta(existingText: existing, incomingDelta: incoming)
+
+        XCTAssertEqual(merged, "prefix-" + overlap + "-suffix")
     }
 
     func testMarkTurnCompletedFinalizesAllAssistantItemsForTurn() {
